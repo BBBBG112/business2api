@@ -15,30 +15,6 @@ function isNavigationError(err) {
            msg.includes('session closed');
 }
 
-// 安全地等待并输入文本（带重试）
-async function safeTypeInput(page, selector, text, options = {}, maxRetries = 3) {
-    for (let i = 0; i < maxRetries; i++) {
-        try {
-            // 先确保元素存在
-            await page.waitForSelector(selector, { timeout: 10000 });
-            await page.type(selector, text, options);
-            return true;
-        } catch (err) {
-            if (isNavigationError(err)) {
-                return false; // 导航错误，认为可能成功
-            }
-            if (err.message.includes('No element found')) {
-                // 元素未找到，等待后重试
-                await new Promise(r => setTimeout(r, 2000));
-                continue;
-            }
-            if (i === maxRetries - 1) throw err;
-            await new Promise(r => setTimeout(r, 1000));
-        }
-    }
-    return false;
-}
-
 // 解析命令行参数
 function parseArgs() {
     const args = process.argv.slice(2);
@@ -393,12 +369,16 @@ async function runTask(threadId, config) {
 
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // 使用安全输入方法（带重试）
-        const emailTyped = await safeTypeInput(page, 'input', email, { delay: 30 });
-        if (emailTyped) {
+        // 使用 type 方法模拟真实键盘输入
+        try {
+            await page.type('input', email, { delay: 30 });
             if (!quietMode) console.log(`[线程 ${threadId}] 已填写邮箱:`, email);
-        } else {
-            if (!quietMode) console.log(`[线程 ${threadId}] 邮箱输入时页面可能已导航`);
+        } catch (typeErr) {
+            if (isNavigationError(typeErr)) {
+                if (!quietMode) console.log(`[线程 ${threadId}] 邮箱输入时页面导航`);
+            } else {
+                throw typeErr;
+            }
         }
 
         // 等待一下
@@ -560,7 +540,9 @@ async function runTask(threadId, config) {
                 break;
             } catch (err) {
                 // 页面导航错误通常表示操作成功
-                if (isNavigationError(err)) {
+                if (err.message.includes('Execution context was destroyed') || 
+                    err.message.includes('navigation') ||
+                    err.message.includes('detached')) {
                     if (!quietMode) console.log(`[线程 ${threadId}] ✓ 检测到页面导航，等待页面加载...`);
                     navigationDetected = true;
                     // 等待页面稳定
@@ -728,12 +710,16 @@ async function runTask(threadId, config) {
 
             await new Promise(resolve => setTimeout(resolve, 500));
 
-            // 使用安全输入方法输入验证码
-            const codeTyped = await safeTypeInput(page, 'input', verificationCode, { delay: 30 });
-            if (codeTyped) {
+            // 使用 type 方法输入验证码
+            try {
+                await page.type('input', verificationCode, { delay: 30 });
                 if (!quietMode) console.log(`[线程 ${threadId}] 已填写验证码`);
-            } else {
-                if (!quietMode) console.log(`[线程 ${threadId}] 验证码输入时页面可能已导航`);
+            } catch (typeErr) {
+                if (isNavigationError(typeErr)) {
+                    if (!quietMode) console.log(`[线程 ${threadId}] 验证码输入时页面已导航`);
+                } else {
+                    throw typeErr;
+                }
             }
 
             await new Promise(resolve => setTimeout(resolve, 2000));
@@ -785,7 +771,9 @@ async function runTask(threadId, config) {
                         if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/5: 未找到验证提交按钮，等待重试...`);
                     }
                 } catch (clickErr) {
-                    if (isNavigationError(clickErr)) {
+                    if (clickErr.message.includes('Execution context was destroyed') || 
+                        clickErr.message.includes('navigation') ||
+                        clickErr.message.includes('detached')) {
                         if (!quietMode) console.log(`[线程 ${threadId}] 点击验证按钮后页面已导航`);
                         verifyNavigation = true;
                         verifySubmitted = true;
@@ -847,7 +835,8 @@ async function runTask(threadId, config) {
                 });
             } catch (err) {
                 // 页面导航导致上下文销毁，说明验证成功并跳转了
-                if (isNavigationError(err)) {
+                if (err.message.includes('Execution context was destroyed') || 
+                    err.message.includes('navigation')) {
                     if (!quietMode) console.log(`[线程 ${threadId}] ✓ 页面已跳转，验证码验证成功`);
                     verifyResult = { success: true, error: null };
                 } else {
@@ -873,7 +862,7 @@ async function runTask(threadId, config) {
         try {
             await page.waitForSelector('input', { timeout: 30000 });
         } catch (waitErr) {
-            if (isNavigationError(waitErr)) {
+            if (waitErr.message.includes('Execution context was destroyed') || waitErr.message.includes('navigation')) {
                 if (!quietMode) console.log(`[线程 ${threadId}] 等待输入框时页面导航`);
             }
         }
@@ -895,12 +884,16 @@ async function runTask(threadId, config) {
 
         await new Promise(resolve => setTimeout(resolve, 500));
 
-        // 使用安全输入方法输入全名
-        const nameTyped = await safeTypeInput(page, 'input', fullName, { delay: 30 });
-        if (nameTyped) {
+        // 使用 type 方法输入全名
+        try {
+            await page.type('input', fullName, { delay: 30 });
             if (!quietMode) console.log(`[线程 ${threadId}] 已填写全名`);
-        } else {
-            if (!quietMode) console.log(`[线程 ${threadId}] 全名输入时页面可能已导航`);
+        } catch (typeErr) {
+            if (typeErr.message.includes('Execution context was destroyed') || typeErr.message.includes('navigation')) {
+                if (!quietMode) console.log(`[线程 ${threadId}] 全名输入时页面已导航`);
+            } else {
+                throw typeErr;
+            }
         }
 
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -963,7 +956,9 @@ async function runTask(threadId, config) {
                     if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/5: 未找到确认按钮，等待重试...`);
                 }
             } catch (confirmErr) {
-                if (isNavigationError(confirmErr)) {
+                if (confirmErr.message.includes('Execution context was destroyed') || 
+                    confirmErr.message.includes('navigation') ||
+                    confirmErr.message.includes('detached')) {
                     if (!quietMode) console.log(`[线程 ${threadId}] 点击确认按钮后页面已导航`);
                     confirmNavigation = true;
                     confirmSubmitted = true;
@@ -1003,7 +998,7 @@ async function runTask(threadId, config) {
                 });
             } catch (err) {
                 // 忽略页面导航导致的上下文销毁错误
-                if (!isNavigationError(err)) {
+                if (!err.message.includes('Execution context was destroyed')) {
                     console.error(`[线程 ${threadId}] 检查按钮时出错:`, err.message);
                 }
             }

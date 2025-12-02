@@ -76,22 +76,67 @@ func generateRandomName() string {
 	return firstNames[rand.Intn(len(firstNames))] + " " + lastNames[rand.Intn(len(lastNames))]
 }
 
-// getTemporaryEmail 获取临时邮箱
+// TempMailProvider 临时邮箱提供商
+type TempMailProvider struct {
+	Name        string
+	GenerateURL string
+	CheckURL    string
+	Headers     map[string]string
+}
+
+// 支持的临时邮箱提供商列表
+var tempMailProviders = []TempMailProvider{
+	{
+		Name:        "chatgpt.org.uk",
+		GenerateURL: "https://mail.chatgpt.org.uk/api/generate-email",
+		CheckURL:    "https://mail.chatgpt.org.uk/api/emails?email=%s",
+		Headers: map[string]string{
+			"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+			"Referer":    "https://mail.chatgpt.org.uk",
+		},
+	},
+	// 备用邮箱服务可以在这里添加
+}
+
+// getTemporaryEmail 获取临时邮箱（支持多个提供商）
 func getTemporaryEmail() (string, error) {
-	req, _ := http.NewRequest("GET", "https://mail.chatgpt.org.uk/api/generate-email", nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-	req.Header.Set("Referer", "https://mail.chatgpt.org.uk")
+	var lastErr error
+
+	for _, provider := range tempMailProviders {
+		email, err := getEmailFromProvider(provider)
+		if err != nil {
+			lastErr = err
+			log.Printf("⚠️ 临时邮箱 %s 失败: %v，尝试下一个", provider.Name, err)
+			continue
+		}
+		log.Printf("✅ 获取临时邮箱成功 (%s): %s", provider.Name, email)
+		return email, nil
+	}
+
+	return "", fmt.Errorf("所有临时邮箱服务均失败: %v", lastErr)
+}
+
+// getEmailFromProvider 从指定提供商获取邮箱
+func getEmailFromProvider(provider TempMailProvider) (string, error) {
+	req, _ := http.NewRequest("GET", provider.GenerateURL, nil)
+	for k, v := range provider.Headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("获取临时邮箱失败: %w", err)
+		return "", fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 
 	body, _ := readResponseBody(resp)
 	var result TempEmailResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("解析临时邮箱响应失败: %w", err)
+		return "", fmt.Errorf("解析响应失败: %w", err)
 	}
 
 	email := result.Email
@@ -99,7 +144,7 @@ func getTemporaryEmail() (string, error) {
 		email = result.Data.Email
 	}
 	if email == "" {
-		return "", fmt.Errorf("获取临时邮箱为空")
+		return "", fmt.Errorf("返回的邮箱为空")
 	}
 	return email, nil
 }
@@ -209,28 +254,51 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	// 启动浏览器 - 优先使用系统浏览器
 	l := launcher.New()
 
-	// 检测系统浏览器
+	// 检测系统浏览器（支持更多环境）
 	systemBrowsers := []string{
+		// Linux
 		"/usr/bin/google-chrome",
 		"/usr/bin/google-chrome-stable",
 		"/usr/bin/chromium",
 		"/usr/bin/chromium-browser",
 		"/snap/bin/chromium",
 		"/opt/google/chrome/chrome",
+		// Docker/Alpine
+		"/usr/bin/chromium-browser",
+		"/usr/lib/chromium/chromium",
+		// Windows
+		"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+		"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+		// macOS
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
 	}
+
+	browserFound := false
 	for _, path := range systemBrowsers {
 		if _, err := os.Stat(path); err == nil {
 			l = l.Bin(path)
+			browserFound = true
+			log.Printf("[注册 %d] 使用浏览器: %s", threadID, path)
 			break
 		}
 	}
 
+	if !browserFound {
+		log.Printf("[注册 %d] ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", threadID)
+	}
+
+	// 设置启动参数（兼容更多环境）
 	l = l.Headless(headless).
 		Set("no-sandbox").
 		Set("disable-setuid-sandbox").
 		Set("disable-dev-shm-usage").
+		Set("disable-gpu").
+		Set("disable-software-rasterizer").
 		Set("disable-blink-features", "AutomationControlled").
-		Set("window-size", "1280,800")
+		Set("window-size", "1280,800").
+		Set("lang", "zh-CN").
+		Set("disable-extensions")
 
 	if proxy != "" {
 		l = l.Proxy(proxy)
@@ -516,7 +584,6 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	// 填写姓名
 	fullName := generateRandomName()
 	result.FullName = fullName
-	log.Printf("[注册 %d] 填写姓名: %s", threadID, fullName)
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -580,9 +647,6 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 		time.Sleep(1000 * time.Millisecond)
 	}
-
-	// 等待获取 authorization
-	log.Printf("[注册 %d] 等待获取 authorization...", threadID)
 	for i := 0; i < 15; i++ {
 		time.Sleep(2 * time.Second)
 
@@ -675,6 +739,339 @@ func SaveBrowserRegisterResult(result *BrowserRegisterResult, dataDir string) er
 	}
 
 	return nil
+}
+
+// ==================== 浏览器 Cookie 刷新（重新登录） ====================
+
+// BrowserRefreshResult Cookie刷新结果
+type BrowserRefreshResult struct {
+	Success       bool
+	SecureCookies []Cookie
+	ConfigID      string
+	CSESIDX       string
+	Authorization string
+	Error         error
+}
+
+// RefreshCookieWithBrowser 使用浏览器重新登录刷新Cookie（用于401账号）
+// 流程：注入老Cookie → 访问页面 → 输入邮箱 → 获取验证码 → 完成登录
+func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *BrowserRefreshResult {
+	result := &BrowserRefreshResult{}
+	email := acc.Data.Email
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Cookie刷新] ☠️ [%s] panic: %v", email, r)
+			result.Error = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	log.Printf("[Cookie刷新] 🔄 [%s] 开始刷新流程...", email)
+
+	// 启动浏览器
+	l := launcher.New()
+	systemBrowsers := []string{
+		"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+		"/usr/bin/chromium", "/usr/bin/chromium-browser",
+		"/snap/bin/chromium", "/opt/google/chrome/chrome",
+		"/usr/lib/chromium/chromium",
+		"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+	}
+	for _, path := range systemBrowsers {
+		if _, err := os.Stat(path); err == nil {
+			l = l.Bin(path)
+			break
+		}
+	}
+
+	l = l.Headless(headless).
+		Set("no-sandbox").
+		Set("disable-setuid-sandbox").
+		Set("disable-dev-shm-usage").
+		Set("disable-gpu").
+		Set("disable-blink-features", "AutomationControlled").
+		Set("window-size", "1280,800")
+
+	if proxy != "" {
+		l = l.Proxy(proxy)
+	}
+
+	url, err := l.Launch()
+	if err != nil {
+		result.Error = fmt.Errorf("启动浏览器失败: %w", err)
+		return result
+	}
+
+	browser := rod.New().ControlURL(url)
+	if err := browser.Connect(); err != nil {
+		result.Error = fmt.Errorf("连接浏览器失败: %w", err)
+		return result
+	}
+	defer browser.Close()
+
+	browser = browser.Timeout(120 * time.Second)
+
+	pages, _ := browser.Pages()
+	var page *rod.Page
+	if len(pages) > 0 {
+		page = pages[0]
+	} else {
+		page, _ = browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
+	}
+
+	page.MustSetViewport(1280, 800, 1, false)
+	page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
+		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	})
+
+	// 监听请求以捕获 authorization
+	var authorization string
+	var configID, csesidx string
+
+	go page.EachEvent(func(e *proto.NetworkRequestWillBeSent) {
+		if auth, ok := e.Request.Headers["authorization"]; ok {
+			if authStr := auth.String(); authStr != "" {
+				authorization = authStr
+			}
+		}
+		reqURL := e.Request.URL
+		if m := regexp.MustCompile(`/cid/([a-f0-9-]+)`).FindStringSubmatch(reqURL); len(m) > 1 && configID == "" {
+			configID = m[1]
+		}
+		if m := regexp.MustCompile(`[?&]csesidx=(\d+)`).FindStringSubmatch(reqURL); len(m) > 1 && csesidx == "" {
+			csesidx = m[1]
+		}
+	})()
+
+	// 先访问目标域名以便设置Cookie
+	page.Navigate("https://business.gemini.google")
+	page.WaitLoad()
+	time.Sleep(500 * time.Millisecond)
+
+	// 注入老的Cookie
+	existingCookies := acc.Data.Cookies
+	if len(existingCookies) > 0 {
+		log.Printf("[Cookie刷新] [%s] 注入 %d 个现有Cookie", email, len(existingCookies))
+		for _, c := range existingCookies {
+			cookie := &proto.NetworkCookieParam{
+				Name:   c.Name,
+				Value:  c.Value,
+				Domain: c.Domain,
+				Path:   "/",
+				Secure: true,
+			}
+			page.SetCookies([]*proto.NetworkCookieParam{cookie})
+		}
+	}
+
+	// 刷新页面让Cookie生效
+	log.Printf("[Cookie刷新] [%s] 刷新页面...", email)
+	page.Reload()
+	page.WaitLoad()
+	time.Sleep(2 * time.Second)
+
+	// 检查页面状态
+	info, _ := page.Info()
+	currentURL := ""
+	if info != nil {
+		currentURL = info.URL
+	}
+
+	// 检查是否已经登录成功（有authorization）
+	if authorization != "" {
+		log.Printf("[Cookie刷新] [%s] Cookie有效，已自动登录", email)
+		goto extractResult
+	}
+
+	// 检查是否在登录页面需要输入邮箱
+	if _, err := page.Timeout(5 * time.Second).Element("input"); err == nil {
+		log.Printf("[Cookie刷新] [%s] 需要输入邮箱...", email)
+
+		// 输入邮箱
+		page.Eval(`() => {
+			const inputs = document.querySelectorAll('input');
+			if (inputs.length > 0) {
+				inputs[0].click();
+				inputs[0].focus();
+			}
+		}`)
+		time.Sleep(200 * time.Millisecond)
+		safeType(page, email, 15)
+		time.Sleep(500 * time.Millisecond)
+		page.Eval(`() => {
+			const inputs = document.querySelectorAll('input');
+			if (inputs.length > 0) { inputs[0].blur(); }
+		}`)
+		time.Sleep(500 * time.Millisecond)
+
+		// 点击继续按钮
+		for i := 0; i < 5; i++ {
+			clickResult, _ := page.Eval(`() => {
+				const targets = ['继续', 'Next', 'Continue', '邮箱'];
+				const elements = [...document.querySelectorAll('button'), ...document.querySelectorAll('div[role="button"]')];
+				for (const el of elements) {
+					if (!el || el.disabled) continue;
+					const style = window.getComputedStyle(el);
+					if (style.display === 'none' || style.visibility === 'hidden') continue;
+					const text = el.textContent ? el.textContent.trim() : '';
+					if (targets.some(t => text.includes(t))) { el.click(); return {clicked:true}; }
+				}
+				return {clicked:false};
+			}`)
+			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// 等待并获取验证码邮件
+	log.Printf("[Cookie刷新] [%s] 等待验证码邮件...", email)
+	{
+		var emailContent *EmailContent
+		for attempt := 0; attempt < 3; attempt++ {
+			emailContent, _ = getVerificationEmailQuick(email, 20, 2)
+			if emailContent != nil {
+				break
+			}
+			// 尝试点击重发
+			if attempt < 2 {
+				page.Eval(`() => {
+					const texts = ['重新发送', 'Resend', '重发', 'Send again'];
+					const els = [...document.querySelectorAll('a'), ...document.querySelectorAll('button'), ...document.querySelectorAll('span')];
+					for (const el of els) {
+						if (!el) continue;
+						const text = el.textContent ? el.textContent.trim() : '';
+						if (text && texts.some(t => text.toLowerCase().includes(t.toLowerCase()))) { el.click(); return true; }
+					}
+					return false;
+				}`)
+				time.Sleep(2 * time.Second)
+			}
+		}
+
+		if emailContent == nil {
+			result.Error = fmt.Errorf("无法获取验证码邮件")
+			return result
+		}
+
+		// 提取验证码
+		code, err := extractVerificationCode(emailContent.Content)
+		if err != nil {
+			result.Error = err
+			return result
+		}
+		log.Printf("[Cookie刷新] [%s] 获取到验证码: %s", email, code)
+
+		// 输入验证码
+		time.Sleep(500 * time.Millisecond)
+		page.Eval(`() => {
+			const inputs = document.querySelectorAll('input');
+			if (inputs.length > 0) { inputs[0].value = ''; inputs[0].click(); inputs[0].focus(); }
+		}`)
+		time.Sleep(200 * time.Millisecond)
+		safeType(page, code, 15)
+		time.Sleep(500 * time.Millisecond)
+		page.Eval(`() => {
+			const inputs = document.querySelectorAll('input');
+			if (inputs.length > 0) { inputs[0].blur(); }
+		}`)
+		time.Sleep(500 * time.Millisecond)
+
+		// 点击验证按钮
+		for i := 0; i < 5; i++ {
+			clickResult, _ := page.Eval(`() => {
+				const targets = ['验证', 'Verify', '继续', 'Next', 'Continue'];
+				const els = [...document.querySelectorAll('button'), ...document.querySelectorAll('div[role="button"]')];
+				for (const el of els) {
+					if (!el || el.disabled) continue;
+					const style = window.getComputedStyle(el);
+					if (style.display === 'none' || style.visibility === 'hidden') continue;
+					const text = el.textContent ? el.textContent.trim() : '';
+					if (targets.some(t => text.includes(t))) { el.click(); return {clicked:true}; }
+				}
+				return {clicked:false};
+			}`)
+			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// 等待登录完成
+	log.Printf("[Cookie刷新] [%s] 等待登录完成...", email)
+	for i := 0; i < 15; i++ {
+		time.Sleep(2 * time.Second)
+
+		// 点击可能出现的确认按钮
+		page.Eval(`() => {
+			const btns = document.querySelectorAll('button');
+			for (const btn of btns) {
+				const text = btn.textContent || '';
+				if ((text.includes('同意') || text.includes('Confirm') || text.includes('继续') || text.includes('I agree')) && btn.offsetParent !== null && !btn.disabled) {
+					btn.click(); return true;
+				}
+			}
+			return false;
+		}`)
+
+		// 从URL提取信息
+		info, _ := page.Info()
+		if info != nil {
+			if m := regexp.MustCompile(`/cid/([a-f0-9-]+)`).FindStringSubmatch(info.URL); len(m) > 1 && configID == "" {
+				configID = m[1]
+			}
+			if m := regexp.MustCompile(`[?&]csesidx=(\d+)`).FindStringSubmatch(info.URL); len(m) > 1 && csesidx == "" {
+				csesidx = m[1]
+			}
+		}
+
+		if authorization != "" {
+			break
+		}
+	}
+
+extractResult:
+	if authorization == "" {
+		result.Error = fmt.Errorf("未能获取 Authorization")
+		return result
+	}
+
+	// 获取cookies
+	cookies, _ := page.Cookies(nil)
+	var resultCookies []Cookie
+	for _, c := range cookies {
+		resultCookies = append(resultCookies, Cookie{
+			Name:   c.Name,
+			Value:  c.Value,
+			Domain: c.Domain,
+		})
+	}
+
+	// 从URL提取最终信息
+	info, _ = page.Info()
+	if info != nil {
+		currentURL = info.URL
+		if m := regexp.MustCompile(`/cid/([a-f0-9-]+)`).FindStringSubmatch(currentURL); len(m) > 1 && configID == "" {
+			configID = m[1]
+		}
+		if m := regexp.MustCompile(`[?&]csesidx=(\d+)`).FindStringSubmatch(currentURL); len(m) > 1 && csesidx == "" {
+			csesidx = m[1]
+		}
+	}
+
+	result.Success = true
+	result.Authorization = authorization
+	result.SecureCookies = resultCookies
+	result.ConfigID = configID
+	result.CSESIDX = csesidx
+
+	log.Printf("[Cookie刷新] ✅ [%s] 刷新成功", email)
+	return result
 }
 
 // NativeRegisterWorker 原生 Go 注册 worker

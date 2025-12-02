@@ -10,8 +10,11 @@
     "register_threads": 1,
     "register_headless": true,
     "refresh_on_startup": true,
-    "refresh_cooldown_sec": 300,
-    "use_cooldown_sec": 30
+    "refresh_cooldown_sec": 240,
+    "use_cooldown_sec": 15,
+    "max_fail_count": 3,
+    "enable_browser_refresh": true,
+    "browser_refresh_headless": true
   },
   "proxy": ""
 }

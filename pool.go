@@ -36,25 +36,42 @@ type AccountData struct {
 	CSESIDX       string   `json:"csesidx,omitempty"`
 }
 
+// AccountStatus 账号状态
+type AccountStatus int
+
+const (
+	StatusPending  AccountStatus = iota // 待刷新
+	StatusReady                         // 就绪可用
+	StatusCooldown                      // 冷却中
+	StatusInvalid                       // 失效
+)
+
 // Account 账号实例
 type Account struct {
-	Data        AccountData
-	FilePath    string
-	JWT         string
-	JWTExpires  time.Time
-	ConfigID    string
-	CSESIDX     string
-	LastRefresh time.Time
-	LastUsed    time.Time // 最后使用时间
-	Refreshed   bool
-	FailCount   int // 刷新失败次数
-	mu          sync.Mutex
+	Data         AccountData
+	FilePath     string
+	JWT          string
+	JWTExpires   time.Time
+	ConfigID     string
+	CSESIDX      string
+	LastRefresh  time.Time
+	LastUsed     time.Time // 最后使用时间
+	Refreshed    bool
+	FailCount    int // 连续失败次数
+	SuccessCount int // 成功次数
+	TotalCount   int // 总使用次数
+	Status       AccountStatus
+	mu           sync.Mutex
 }
 
+// 默认冷却时间（可通过配置覆盖）
 var (
-	refreshCooldown     = 4 * time.Minute
-	useCooldown         = 10 * time.Second // 使用冷却，防止同一账号短时间内被重复使用
-	idleRefreshInterval = 5 * time.Hour    // 5小时未使用或未刷新则刷新
+	RefreshCooldown        = 4 * time.Minute  // 刷新冷却
+	UseCooldown            = 15 * time.Second // 使用冷却
+	JWTRefreshThreshold    = 60 * time.Second // JWT刷新阈值
+	MaxFailCount           = 3                // 最大连续失败次数
+	EnableBrowserRefresh   = true             // 是否启用浏览器刷新
+	BrowserRefreshHeadless = true             // 浏览器刷新是否无头模式
 )
 
 type AccountPool struct {
@@ -65,24 +82,27 @@ type AccountPool struct {
 	refreshInterval time.Duration
 	refreshWorkers  int
 	stopChan        chan struct{}
-}
-
-// SetRefreshCooldown 设置刷新冷却时间
-func (p *AccountPool) SetRefreshCooldown(d time.Duration) {
-	refreshCooldown = d
-	log.Printf("⚙️ 刷新冷却时间设置为: %v", d)
-}
-
-// SetUseCooldown 设置使用冷却时间
-func (p *AccountPool) SetUseCooldown(d time.Duration) {
-	useCooldown = d
-	log.Printf("⚙️ 使用冷却时间设置为: %v", d)
+	// 统计
+	totalSuccess  int64
+	totalFailed   int64
+	totalRequests int64
 }
 
 var pool = &AccountPool{
 	refreshInterval: 5 * time.Second,
 	refreshWorkers:  5,
 	stopChan:        make(chan struct{}),
+}
+
+// SetCooldowns 设置冷却时间（从配置加载）
+func SetCooldowns(refreshSec, useSec int) {
+	if refreshSec > 0 {
+		RefreshCooldown = time.Duration(refreshSec) * time.Second
+	}
+	if useSec > 0 {
+		UseCooldown = time.Duration(useSec) * time.Second
+	}
+	log.Printf("⚙️ 冷却配置: 刷新=%v, 使用=%v", RefreshCooldown, UseCooldown)
 }
 
 func (p *AccountPool) Load(dir string) error {
@@ -246,41 +266,122 @@ func (p *AccountPool) refreshWorker(id int) {
 			continue
 		}
 
-		if time.Since(acc.LastRefresh) < refreshCooldown {
+		// 检查冷却
+		if time.Since(acc.LastRefresh) < RefreshCooldown {
+			acc.mu.Lock()
 			acc.Refreshed = true
+			acc.Status = StatusReady
+			acc.mu.Unlock()
 			p.MarkReady(acc)
 			continue
 		}
 
 		acc.JWTExpires = time.Time{}
 		if err := acc.RefreshJWT(); err != nil {
-			if strings.Contains(err.Error(), "刷新冷却中") {
-				acc.Refreshed = true
-				p.MarkReady(acc)
-			} else if strings.Contains(err.Error(), "账号失效") {
-				// 401/403 认证失败，直接删除
-				log.Printf("❌ [worker-%d] [%s] 认证失败，删除账号", id, acc.Data.Email)
-				p.RemoveAccount(acc)
-			} else {
-				// 其他错误，记录失败次数，超3次则删除
+			errMsg := err.Error()
+
+			// 认证失败：尝试浏览器刷新（不删除账号）
+			if strings.Contains(errMsg, "账号失效") ||
+				strings.Contains(errMsg, "401") ||
+				strings.Contains(errMsg, "403") {
+				log.Printf("⚠️ [worker-%d] [%s] 认证失效: %v", id, acc.Data.Email, err)
+
+				// 尝试浏览器刷新
+				if EnableBrowserRefresh {
+					log.Printf("🌐 [worker-%d] [%s] 尝试浏览器刷新Cookie...", id, acc.Data.Email)
+					refreshResult := RefreshCookieWithBrowser(acc, BrowserRefreshHeadless, Proxy)
+
+					if refreshResult.Success {
+						// 更新账号数据（完整的重新登录结果）
+						acc.mu.Lock()
+						acc.Data.Cookies = refreshResult.SecureCookies
+						if refreshResult.Authorization != "" {
+							acc.Data.Authorization = refreshResult.Authorization
+						}
+						if refreshResult.ConfigID != "" {
+							acc.ConfigID = refreshResult.ConfigID
+							acc.Data.ConfigID = refreshResult.ConfigID
+						}
+						if refreshResult.CSESIDX != "" {
+							acc.CSESIDX = refreshResult.CSESIDX
+							acc.Data.CSESIDX = refreshResult.CSESIDX
+						}
+						acc.FailCount = 0
+						acc.JWTExpires = time.Time{} // 重置JWT过期时间
+						acc.Status = StatusPending
+						acc.mu.Unlock()
+
+						// 保存更新后的账号
+						if err := acc.SaveToFile(); err != nil {
+							log.Printf("⚠️ [%s] 保存刷新后的账号失败: %v", acc.Data.Email, err)
+						}
+
+						log.Printf("✅ [worker-%d] [%s] 浏览器重新登录成功，重新加入刷新队列", id, acc.Data.Email)
+						p.mu.Lock()
+						p.pendingAccounts = append(p.pendingAccounts, acc)
+						p.mu.Unlock()
+						continue
+					} else {
+						log.Printf("⚠️ [worker-%d] [%s] 浏览器重新登录失败: %v", id, acc.Data.Email, refreshResult.Error)
+					}
+				}
+
+				// 浏览器刷新失败或未启用：累计失败次数，稍后重试（不删除账号）
 				acc.mu.Lock()
 				acc.FailCount++
 				failCount := acc.FailCount
 				acc.mu.Unlock()
 
-				if failCount >= 3 {
-					log.Printf("❌ [worker-%d] [%s] 刷新失败%d次，删除账号", id, acc.Data.Email, failCount)
-					p.RemoveAccount(acc)
-				} else {
-					log.Printf("⚠️ [worker-%d] [%s] 刷新失败(%d/3): %v，稍后重试", id, acc.Data.Email, failCount, err)
-					p.MarkPending(acc)
+				waitTime := time.Duration(failCount*30) * time.Second // 递增等待：30s, 60s, 90s...
+				if waitTime > 5*time.Minute {
+					waitTime = 5 * time.Minute // 最大等待5分钟
 				}
+				log.Printf("⏳ [worker-%d] [%s] 401刷新失败 (%d次)，%v后重试", id, acc.Data.Email, failCount, waitTime)
+				time.Sleep(waitTime)
+
+				p.mu.Lock()
+				p.pendingAccounts = append(p.pendingAccounts, acc)
+				p.mu.Unlock()
+				continue
+			}
+
+			// 冷却中：直接标记就绪
+			if strings.Contains(errMsg, "刷新冷却中") {
+				acc.mu.Lock()
+				acc.Refreshed = true
+				acc.Status = StatusReady
+				acc.mu.Unlock()
+				p.MarkReady(acc)
+				continue
+			}
+
+			// 其他错误：累计失败次数
+			acc.mu.Lock()
+			acc.FailCount++
+			failCount := acc.FailCount
+			acc.mu.Unlock()
+
+			if failCount >= MaxFailCount {
+				log.Printf("❌ [worker-%d] [%s] 连续失败 %d 次，移除账号: %v", id, acc.Data.Email, failCount, err)
+				acc.mu.Lock()
+				acc.Status = StatusInvalid
+				acc.mu.Unlock()
+				p.RemoveAccount(acc)
+			} else {
+				log.Printf("⚠️ [worker-%d] [%s] 刷新失败 (%d/%d): %v", id, acc.Data.Email, failCount, MaxFailCount, err)
+				// 延迟后重试
+				time.Sleep(time.Duration(failCount) * 5 * time.Second)
+				p.mu.Lock()
+				p.pendingAccounts = append(p.pendingAccounts, acc)
+				p.mu.Unlock()
 			}
 		} else {
-			// 成功刷新，重置失败计数
+			// 刷新成功：重置失败计数
 			acc.mu.Lock()
 			acc.FailCount = 0
+			acc.Status = StatusReady
 			acc.mu.Unlock()
+
 			if err := acc.SaveToFile(); err != nil {
 				log.Printf("⚠️ [%s] 写回文件失败: %v", acc.Data.Email, err)
 			}
@@ -290,10 +391,10 @@ func (p *AccountPool) refreshWorker(id int) {
 }
 
 func (p *AccountPool) scanWorker() {
+	ticker := time.NewTicker(p.refreshInterval)
 	fileScanTicker := time.NewTicker(5 * time.Minute)
-	idleRefreshTicker := time.NewTicker(30 * time.Minute) // 每30分钟检查一次未使用账号
+	defer ticker.Stop()
 	defer fileScanTicker.Stop()
-	defer idleRefreshTicker.Stop()
 
 	for {
 		select {
@@ -301,14 +402,14 @@ func (p *AccountPool) scanWorker() {
 			return
 		case <-fileScanTicker.C:
 			p.Load(DataDir)
-		case <-idleRefreshTicker.C:
-			p.RefreshIdleAccounts()
+		case <-ticker.C:
+			p.RefreshExpiredAccounts()
 		}
 	}
 }
 
-// RefreshIdleAccounts 刷新5小时未使用或未刷新的账号
-func (p *AccountPool) RefreshIdleAccounts() {
+// RefreshExpiredAccounts 刷新即将过期的账号
+func (p *AccountPool) RefreshExpiredAccounts() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -318,16 +419,14 @@ func (p *AccountPool) RefreshIdleAccounts() {
 
 	for _, acc := range p.readyAccounts {
 		acc.mu.Lock()
+		jwtExpires := acc.JWTExpires
 		lastRefresh := acc.LastRefresh
-		lastUsed := acc.LastUsed
 		acc.mu.Unlock()
 
-		// 5小时未使用或未刷新
-		idleSinceRefresh := now.Sub(lastRefresh) >= idleRefreshInterval
-		idleSinceUse := lastUsed.IsZero() || now.Sub(lastUsed) >= idleRefreshInterval
-		inCooldown := now.Sub(lastRefresh) < refreshCooldown
+		needsRefresh := jwtExpires.IsZero() || now.Add(JWTRefreshThreshold).After(jwtExpires)
+		inCooldown := now.Sub(lastRefresh) < RefreshCooldown
 
-		if (idleSinceRefresh || idleSinceUse) && !inCooldown {
+		if needsRefresh && !inCooldown {
 			acc.mu.Lock()
 			acc.Refreshed = false
 			acc.mu.Unlock()
@@ -340,7 +439,7 @@ func (p *AccountPool) RefreshIdleAccounts() {
 
 	p.readyAccounts = stillReady
 	if refreshed > 0 {
-		log.Printf("🔄 空闲刷新: %d 个账号超过5小时未使用或未刷新", refreshed)
+		log.Printf("🔄 扫描刷新: %d 个账号JWT即将过期", refreshed)
 	}
 }
 
@@ -352,7 +451,7 @@ func (p *AccountPool) RefreshAllAccounts() {
 	refreshed, skipped := 0, 0
 
 	for _, acc := range p.readyAccounts {
-		if time.Since(acc.LastRefresh) < refreshCooldown {
+		if time.Since(acc.LastRefresh) < RefreshCooldown {
 			stillReady = append(stillReady, acc)
 			skipped++
 			continue
@@ -364,71 +463,90 @@ func (p *AccountPool) RefreshAllAccounts() {
 	}
 
 	p.readyAccounts = stillReady
-	if refreshed > 0 || skipped > 0 {
+	if refreshed > 0 {
+		log.Printf("🔄 全量刷新: %d 个账号已加入刷新队列，%d 个在冷却中跳过", refreshed, skipped)
 	}
 }
 
 func (p *AccountPool) Next() *Account {
 	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	if len(p.readyAccounts) == 0 {
-		p.mu.RUnlock()
 		return nil
 	}
 
 	n := len(p.readyAccounts)
 	startIdx := atomic.AddUint64(&p.index, 1) - 1
-	var selectedAcc *Account
 	now := time.Now()
 
-	// 优先选择不在使用冷却且不在刷新冷却的账号
+	var bestAccount *Account
+	var oldestUsed time.Time
+
+	// 第一轮：找不在使用冷却中的账号
 	for i := 0; i < n; i++ {
 		acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
 		acc.mu.Lock()
-		inUseCooldown := now.Sub(acc.LastUsed) < useCooldown
-		inRefreshCooldown := now.Sub(acc.LastRefresh) < refreshCooldown
+		inUseCooldown := now.Sub(acc.LastUsed) < UseCooldown
+		lastUsed := acc.LastUsed
 		acc.mu.Unlock()
 
-		// 跳过正在使用冷却中的账号
-		if inUseCooldown {
-			continue
-		}
-		// 优先选择不在刷新冷却的
-		if !inRefreshCooldown {
-			selectedAcc = acc
-			break
-		}
-		// 记录第一个不在使用冷却的账号作为备选
-		if selectedAcc == nil {
-			selectedAcc = acc
-		}
-	}
-
-	// 如果所有账号都在使用冷却中，选择使用时间最早的
-	if selectedAcc == nil {
-		var oldestAcc *Account
-		var oldestTime time.Time
-		for i := 0; i < n; i++ {
-			acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
+		if !inUseCooldown {
+			// 找到可用账号，标记使用时间
 			acc.mu.Lock()
-			lastUsed := acc.LastUsed
+			acc.LastUsed = now
+			acc.TotalCount++
 			acc.mu.Unlock()
-			if oldestAcc == nil || lastUsed.Before(oldestTime) {
-				oldestAcc = acc
-				oldestTime = lastUsed
-			}
+			atomic.AddInt64(&p.totalRequests, 1)
+			return acc
 		}
-		selectedAcc = oldestAcc
-	}
-	p.mu.RUnlock()
 
-	// 取出账号时立即标记使用时间
-	if selectedAcc != nil {
-		selectedAcc.mu.Lock()
-		selectedAcc.LastUsed = time.Now()
-		selectedAcc.mu.Unlock()
+		// 记录最久未使用的账号作为备选
+		if bestAccount == nil || lastUsed.Before(oldestUsed) {
+			bestAccount = acc
+			oldestUsed = lastUsed
+		}
 	}
 
-	return selectedAcc
+	// 所有账号都在冷却中，返回最久未使用的
+	if bestAccount != nil {
+		bestAccount.mu.Lock()
+		bestAccount.LastUsed = now
+		bestAccount.TotalCount++
+		bestAccount.mu.Unlock()
+		atomic.AddInt64(&p.totalRequests, 1)
+		log.Printf("⏳ 所有账号在使用冷却中，选择最久未用: %s", bestAccount.Data.Email)
+	}
+	return bestAccount
+}
+
+// MarkUsed 标记账号已使用（成功）
+func (p *AccountPool) MarkUsed(acc *Account, success bool) {
+	if acc == nil {
+		return
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+
+	if success {
+		acc.SuccessCount++
+		acc.FailCount = 0 // 重置连续失败
+		atomic.AddInt64(&p.totalSuccess, 1)
+	} else {
+		acc.FailCount++
+		atomic.AddInt64(&p.totalFailed, 1)
+	}
+}
+
+// MarkNeedsRefresh 标记账号需要刷新（遇到401/403等）
+func (p *AccountPool) MarkNeedsRefresh(acc *Account) {
+	if acc == nil {
+		return
+	}
+	acc.mu.Lock()
+	acc.LastRefresh = time.Time{} // 重置刷新时间，强制刷新
+	acc.mu.Unlock()
+	p.MarkPending(acc)
 }
 
 func (p *AccountPool) Count() int { p.mu.RLock(); defer p.mu.RUnlock(); return len(p.readyAccounts) }
@@ -448,37 +566,103 @@ func (p *AccountPool) TotalCount() int {
 	return len(p.readyAccounts) + len(p.pendingAccounts)
 }
 
-// MarkNeedsRefresh 标记账号需要刷新（遇到 401 等认证错误时调用）
-func (p *AccountPool) MarkNeedsRefresh(acc *Account) {
-	if acc == nil {
-		return
+// Stats 返回号池统计信息
+func (p *AccountPool) Stats() map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	totalSuccess := atomic.LoadInt64(&p.totalSuccess)
+	totalFailed := atomic.LoadInt64(&p.totalFailed)
+	totalRequests := atomic.LoadInt64(&p.totalRequests)
+
+	successRate := float64(0)
+	if totalRequests > 0 {
+		successRate = float64(totalSuccess) / float64(totalRequests) * 100
 	}
 
+	return map[string]interface{}{
+		"ready":          len(p.readyAccounts),
+		"pending":        len(p.pendingAccounts),
+		"total":          len(p.readyAccounts) + len(p.pendingAccounts),
+		"total_requests": totalRequests,
+		"total_success":  totalSuccess,
+		"total_failed":   totalFailed,
+		"success_rate":   fmt.Sprintf("%.1f%%", successRate),
+		"cooldowns": map[string]interface{}{
+			"refresh_sec": int(RefreshCooldown.Seconds()),
+			"use_sec":     int(UseCooldown.Seconds()),
+		},
+	}
+}
+
+// AccountInfo 账号信息（用于API返回）
+type AccountInfo struct {
+	Email        string    `json:"email"`
+	Status       string    `json:"status"`
+	LastRefresh  time.Time `json:"last_refresh"`
+	LastUsed     time.Time `json:"last_used"`
+	FailCount    int       `json:"fail_count"`
+	SuccessCount int       `json:"success_count"`
+	TotalCount   int       `json:"total_count"`
+	JWTExpires   time.Time `json:"jwt_expires"`
+}
+
+// ListAccounts 列出所有账号信息
+func (p *AccountPool) ListAccounts() []AccountInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var accounts []AccountInfo
+	statusNames := map[AccountStatus]string{
+		StatusPending:  "pending",
+		StatusReady:    "ready",
+		StatusCooldown: "cooldown",
+		StatusInvalid:  "invalid",
+	}
+
+	addAccounts := func(list []*Account) {
+		for _, acc := range list {
+			acc.mu.Lock()
+			info := AccountInfo{
+				Email:        acc.Data.Email,
+				Status:       statusNames[acc.Status],
+				LastRefresh:  acc.LastRefresh,
+				LastUsed:     acc.LastUsed,
+				FailCount:    acc.FailCount,
+				SuccessCount: acc.SuccessCount,
+				TotalCount:   acc.TotalCount,
+				JWTExpires:   acc.JWTExpires,
+			}
+			acc.mu.Unlock()
+			accounts = append(accounts, info)
+		}
+	}
+
+	addAccounts(p.readyAccounts)
+	addAccounts(p.pendingAccounts)
+
+	return accounts
+}
+
+// ForceRefreshAll 强制刷新所有账号
+func (p *AccountPool) ForceRefreshAll() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// 从 ready 列表移除
-	for i, a := range p.readyAccounts {
-		if a == acc {
-			p.readyAccounts = append(p.readyAccounts[:i], p.readyAccounts[i+1:]...)
-			break
-		}
+	count := 0
+	for _, acc := range p.readyAccounts {
+		acc.mu.Lock()
+		acc.Refreshed = false
+		acc.JWTExpires = time.Time{}
+		acc.LastRefresh = time.Time{} // 强制跳过冷却
+		acc.mu.Unlock()
+		p.pendingAccounts = append(p.pendingAccounts, acc)
+		count++
 	}
+	p.readyAccounts = nil
 
-	// 标记需要刷新并加入 pending
-	acc.mu.Lock()
-	acc.Refreshed = false
-	acc.JWTExpires = time.Time{}
-	acc.mu.Unlock()
-
-	// 检查是否已在 pending 中
-	for _, a := range p.pendingAccounts {
-		if a == acc {
-			return
-		}
-	}
-	p.pendingAccounts = append(p.pendingAccounts, acc)
-	log.Printf("⚠️ [%s] 已标记为需要刷新", acc.Data.Email)
+	log.Printf("🔄 强制刷新: %d 个账号已加入刷新队列", count)
+	return count
 }
 
 func urlsafeB64Encode(data []byte) string {
@@ -565,8 +749,8 @@ func (acc *Account) RefreshJWT() error {
 		return nil
 	}
 
-	if time.Since(acc.LastRefresh) < refreshCooldown {
-		return fmt.Errorf("刷新冷却中，剩余 %.0f 秒", (refreshCooldown - time.Since(acc.LastRefresh)).Seconds())
+	if time.Since(acc.LastRefresh) < RefreshCooldown {
+		return fmt.Errorf("刷新冷却中，剩余 %.0f 秒", (RefreshCooldown - time.Since(acc.LastRefresh)).Seconds())
 	}
 
 	secureSES := acc.getCookie("__Secure-C_SES")

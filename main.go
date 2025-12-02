@@ -29,14 +29,17 @@ import (
 // ==================== 配置结构 ====================
 
 type PoolConfig struct {
-	TargetCount          int  `json:"target_count"`           // 目标账号数量
-	MinCount             int  `json:"min_count"`              // 最小账号数，低于此值触发注册
-	CheckIntervalMinutes int  `json:"check_interval_minutes"` // 检查间隔(分钟)
-	RegisterThreads      int  `json:"register_threads"`       // 注册线程数
-	RegisterHeadless     bool `json:"register_headless"`      // 无头模式
-	RefreshOnStartup     bool `json:"refresh_on_startup"`     // 启动时刷新账号
-	RefreshCooldownSec   int  `json:"refresh_cooldown_sec"`   // 刷新冷却时间(秒)
-	UseCooldownSec       int  `json:"use_cooldown_sec"`       // 使用冷却时间(秒)
+	TargetCount            int  `json:"target_count"`             // 目标账号数量
+	MinCount               int  `json:"min_count"`                // 最小账号数，低于此值触发注册
+	CheckIntervalMinutes   int  `json:"check_interval_minutes"`   // 检查间隔(分钟)
+	RegisterThreads        int  `json:"register_threads"`         // 注册线程数
+	RegisterHeadless       bool `json:"register_headless"`        // 无头模式
+	RefreshOnStartup       bool `json:"refresh_on_startup"`       // 启动时刷新账号
+	RefreshCooldownSec     int  `json:"refresh_cooldown_sec"`     // 刷新冷却时间(秒)
+	UseCooldownSec         int  `json:"use_cooldown_sec"`         // 使用冷却时间(秒)
+	MaxFailCount           int  `json:"max_fail_count"`           // 最大连续失败次数
+	EnableBrowserRefresh   bool `json:"enable_browser_refresh"`   // 启用浏览器刷新401账号
+	BrowserRefreshHeadless bool `json:"browser_refresh_headless"` // 浏览器刷新无头模式
 }
 
 type AppConfig struct {
@@ -52,14 +55,17 @@ var appConfig = AppConfig{
 	ListenAddr: ":8000",
 	DataDir:    "./data",
 	Pool: PoolConfig{
-		TargetCount:          50,
-		MinCount:             10,
-		CheckIntervalMinutes: 30,
-		RegisterThreads:      1,
-		RegisterHeadless:     true,
-		RefreshOnStartup:     true,
-		RefreshCooldownSec:   240, // 4分钟
-		UseCooldownSec:       10,  // 10秒内不重复使用同一账号
+		TargetCount:            50,
+		MinCount:               10,
+		CheckIntervalMinutes:   30,
+		RegisterThreads:        1,
+		RegisterHeadless:       true,
+		RefreshOnStartup:       true,
+		RefreshCooldownSec:     240, // 4分钟
+		UseCooldownSec:         15,  // 15秒
+		MaxFailCount:           3,
+		EnableBrowserRefresh:   true, // 默认启用浏览器刷新
+		BrowserRefreshHeadless: true,
 	},
 }
 
@@ -121,12 +127,16 @@ func loadAppConfig() {
 	ListenAddr = appConfig.ListenAddr
 	DefaultConfig = appConfig.DefaultConfig
 
-	// 应用冷却时间配置
-	if appConfig.Pool.RefreshCooldownSec > 0 {
-		pool.SetRefreshCooldown(time.Duration(appConfig.Pool.RefreshCooldownSec) * time.Second)
+	// 应用号池配置
+	SetCooldowns(appConfig.Pool.RefreshCooldownSec, appConfig.Pool.UseCooldownSec)
+	if appConfig.Pool.MaxFailCount > 0 {
+		MaxFailCount = appConfig.Pool.MaxFailCount
 	}
-	if appConfig.Pool.UseCooldownSec > 0 {
-		pool.SetUseCooldown(time.Duration(appConfig.Pool.UseCooldownSec) * time.Second)
+	EnableBrowserRefresh = appConfig.Pool.EnableBrowserRefresh
+	BrowserRefreshHeadless = appConfig.Pool.BrowserRefreshHeadless
+
+	if EnableBrowserRefresh {
+		log.Printf("🌐 浏览器刷新已启用 (headless=%v)", BrowserRefreshHeadless)
 	}
 }
 
@@ -481,8 +491,13 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 	return
 }
 
-// 下载生成的文件（图片或视频）
+// 下载生成的文件（图片或视频）——带重试机制
 func downloadGeneratedFile(jwt, fileId, session, configID, origAuth string) (string, error) {
+	return downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth, 3)
+}
+
+// downloadGeneratedFileWithRetry 下载文件，带重试机制，遇到 401 时尝试切换账号
+func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth string, maxRetries int) (string, error) {
 	// 参数验证
 	if jwt == "" {
 		return "", fmt.Errorf("JWT 为空，无法下载文件")
@@ -495,6 +510,51 @@ func downloadGeneratedFile(jwt, fileId, session, configID, origAuth string) (str
 	}
 
 	log.Printf("📥 开始下载文件: fileId=%s, session=%s", fileId, session)
+
+	var lastErr error
+	currentJWT := jwt
+	currentOrigAuth := origAuth
+
+	for retry := 0; retry < maxRetries; retry++ {
+		result, err := downloadGeneratedFileOnce(currentJWT, fileId, session, configID, currentOrigAuth)
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+		errMsg := err.Error()
+
+		// 检查是否是 401/403 错误
+		if strings.Contains(errMsg, "401") || strings.Contains(errMsg, "403") ||
+			strings.Contains(errMsg, "UNAUTHENTICATED") || strings.Contains(errMsg, "SESSION_COOKIE_INVALID") {
+			log.Printf("⚠️ 下载文件认证失败 (尝试 %d/%d): %v，尝试切换账号...", retry+1, maxRetries, err)
+
+			// 尝试获取新账号
+			newAcc := pool.Next()
+			if newAcc != nil {
+				newJWT, newConfigID, jwtErr := newAcc.GetJWT()
+				if jwtErr == nil {
+					log.Printf("✅ 切换到新账号: %s", newAcc.Data.Email)
+					currentJWT = newJWT
+					currentOrigAuth = newAcc.Data.Authorization
+					// 如果新账号有不同的 configID，也可以更新（但通常 session 是绑定的）
+					_ = newConfigID
+					continue
+				}
+			}
+			log.Printf("❌ 无法获取新账号，重试当前账号...")
+		}
+
+		// 其他错误，等待后重试
+		log.Printf("❌ 下载文件失败 (尝试 %d/%d): %v", retry+1, maxRetries, err)
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return "", fmt.Errorf("下载文件失败，已重试 %d 次: %w", maxRetries, lastErr)
+}
+
+// downloadGeneratedFileOnce 单次下载文件尝试
+func downloadGeneratedFileOnce(jwt, fileId, session, configID, origAuth string) (string, error) {
 
 	// 步骤1: 使用 widgetListSessionFileMetadata 获取文件下载 URL
 	listBody := map[string]interface{}{
@@ -664,7 +724,7 @@ func parseMediaURL(urlStr, defaultType string) *MediaInfo {
 		}
 
 		base64Data := parts[1]
-		mediaType := defaultType
+		var mediaType string
 		var mimeType string
 
 		// 检测媒体类型
@@ -925,7 +985,7 @@ func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel bool) map[string
 					"name":        tool.Function.Name,
 					"description": tool.Function.Description,
 				}
-				if tool.Function.Parameters != nil && len(tool.Function.Parameters) > 0 {
+				if len(tool.Function.Parameters) > 0 {
 					funcDecl["parameters"] = tool.Function.Parameters
 				}
 				functionDeclarations = append(functionDeclarations, funcDecl)
@@ -1007,7 +1067,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	createdTime := time.Now().Unix()
 	clientIP := c.ClientIP()
 	// 入站日志
-	log.Printf("📥 [%s] 请求: model=%s 消息数=%d", clientIP, req.Model, len(req.Messages))
+	log.Printf("📥 [%s] 请求: model=%s ", clientIP, req.Model)
 	// 解析消息：支持多轮对话拼接和系统提示词
 	var textContent string
 	var images []MediaInfo
@@ -1036,40 +1096,28 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			textContent = userText
 		}
 	}
-
 	var respBody []byte
 	var lastErr error
 	var usedAcc *Account
 	var usedJWT, usedOrigAuth, usedConfigID, usedSession string
 
-	retries := 0
-	loopCount := 0
-
-	for {
-		// 检查重试次数（只计算非401错误）
-		if retries >= maxRetries {
-			break
-		}
-		// 防止无限循环
-		if loopCount > 100 {
-			lastErr = fmt.Errorf("重试次数过多，停止重试")
-			break
-		}
-		loopCount++
-
+	for retry := 0; retry < maxRetries; retry++ {
 		acc := pool.Next()
 		if acc == nil {
 			c.JSON(500, gin.H{"error": "没有可用账号"})
 			return
 		}
 		usedAcc = acc
-		log.Printf("📤 [%s] 使用账号: %s (尝试 %d/%d)", clientIP, acc.Data.Email, retries+1, maxRetries)
+		log.Printf("📤 [%s] 使用账号: %s", clientIP, acc.Data.Email)
+
+		if retry > 0 {
+			log.Printf("🔄 第 %d 次重试，切换账号: %s", retry+1, acc.Data.Email)
+		}
 
 		jwt, configID, err := acc.GetJWT()
 		if err != nil {
 			log.Printf("❌ [%s] 获取 JWT 失败: %v", acc.Data.Email, err)
 			lastErr = err
-			retries++
 			continue
 		}
 
@@ -1078,9 +1126,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			log.Printf("❌ [%s] 创建 Session 失败: %v", acc.Data.Email, err)
 			// 401 错误标记账号需要刷新
 			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
-				pool.MarkNeedsRefresh(acc)
-			} else {
-				retries++
+				//		pool.MarkNeedsRefresh(acc)
 			}
 			lastErr = err
 			continue
@@ -1089,7 +1135,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		// 上传媒体文件并获取 fileIds
 		var fileIds []string
 		uploadFailed := false
-		is401 := false
 		for _, media := range images {
 			var fileId string
 			var err error
@@ -1120,20 +1165,12 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			if err != nil {
 				log.Printf("⚠️ [%s] %s上传失败: %v", acc.Data.Email, mediaTypeName, err)
 				uploadFailed = true
-				if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
-					is401 = true
-				}
 				break
 			}
 			fileIds = append(fileIds, fileId)
 		}
 		if uploadFailed {
 			lastErr = fmt.Errorf("媒体上传失败")
-			if is401 {
-				pool.MarkNeedsRefresh(acc)
-			} else {
-				retries++
-			}
 			continue
 		}
 
@@ -1141,10 +1178,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		queryParts := []map[string]interface{}{}
 		if textContent != "" {
 			queryParts = append(queryParts, map[string]interface{}{"text": textContent})
-		}
-		// 确保 query parts 不为空，否则 Google 可能返回空响应
-		if len(queryParts) == 0 {
-			queryParts = append(queryParts, map[string]interface{}{"text": " "})
 		}
 
 		// 检查模型类型后缀
@@ -1189,37 +1222,27 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		if err != nil {
 			log.Printf("❌ [%s] 请求失败: %v", acc.Data.Email, err)
 			lastErr = err
-			retries++
 			continue
 		}
 
 		if resp.StatusCode != 200 {
+			body, _ := readResponseBody(resp)
 			resp.Body.Close()
-			log.Printf("❌ [%s] Google 报错: %d (重试 %d/%d)", acc.Data.Email, resp.StatusCode, retries+1, maxRetries)
-			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-
-			// 401/403/404/500 错误，切换账号
-			switch resp.StatusCode {
-			case 401, 403:
-				log.Printf("⚠️ [%s] %d 认证失败，移至刷新池", acc.Data.Email, resp.StatusCode)
+			log.Printf("❌ [%s] Google 报错: %d %s (重试 %d/%d)", acc.Data.Email, resp.StatusCode, string(body), retry+1, maxRetries)
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+			// 401/403 无权限，标记需要刷新
+			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+				log.Printf("⚠️ [%s] %d 无权限，标记需要刷新", acc.Data.Email, resp.StatusCode)
 				pool.MarkNeedsRefresh(acc)
-			case 404:
-				log.Printf("⚠️ [%s] 404 资源不存在，切换账号", acc.Data.Email)
-				pool.MarkNeedsRefresh(acc)
-			case 500:
-				log.Printf("⚠️ [%s] 500 服务器错误，切换账号", acc.Data.Email)
-				// 500 错误标记冷却，让其他请求暂时不用这个账号
-				acc.mu.Lock()
-				acc.LastUsed = time.Now()
-				acc.mu.Unlock()
-			case 429:
-				acc.mu.Lock()
-				acc.LastRefresh = time.Now() // 触发冷却
-				acc.mu.Unlock()
-				log.Printf("⏳ [%s] 429 限流，账号进入冷却", acc.Data.Email)
-			default:
-				retries++
 			}
+			// 429 限流，延长使用冷却时间
+			if resp.StatusCode == 429 {
+				acc.mu.Lock()
+				acc.LastUsed = time.Now().Add(UseCooldown) // 延长冷却
+				acc.mu.Unlock()
+				log.Printf("⏳ [%s] 429 限流，账号进入延长冷却", acc.Data.Email)
+			}
+			pool.MarkUsed(acc, false) // 标记失败
 			continue
 		}
 
@@ -1229,91 +1252,19 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 		// 快速检查是否是认证错误响应
 		if bytes.Contains(respBody, []byte("uToken")) && !bytes.Contains(respBody, []byte("streamAssistResponse")) {
-			log.Printf("⚠️ [%s] 收到认证响应，移至刷新池", acc.Data.Email)
+			log.Printf("⚠️ [%s] 收到认证响应，标记需要刷新", acc.Data.Email)
 			pool.MarkNeedsRefresh(acc)
 			lastErr = fmt.Errorf("认证失败，需要刷新账号")
 			continue
 		}
 
-		// 预解析检查是否有有效内容
-		var checkDataList []map[string]interface{}
-		if err := json.Unmarshal(respBody, &checkDataList); err == nil {
-			hasValidContent := false
-			hasThought := false
-			for _, data := range checkDataList {
-				streamResp, ok := data["streamAssistResponse"].(map[string]interface{})
-				if !ok {
-					continue
-				}
-				answer, ok := streamResp["answer"].(map[string]interface{})
-				if !ok {
-					continue
-				}
-				replies, ok := answer["replies"].([]interface{})
-				if !ok {
-					continue
-				}
-				for _, reply := range replies {
-					replyMap, ok := reply.(map[string]interface{})
-					if !ok {
-						continue
-					}
-					groundedContent, ok := replyMap["groundedContent"].(map[string]interface{})
-					if !ok {
-						continue
-					}
-					content, ok := groundedContent["content"].(map[string]interface{})
-					if !ok {
-						continue
-					}
-
-					// 检查是否有 functionCall
-					if _, ok := content["functionCall"]; ok {
-						hasValidContent = true
-					}
-					// 检查是否有 text
-					if t, ok := content["text"].(string); ok && t != "" {
-						// 区分 thought 和正文
-						if isThought, _ := content["thought"].(bool); isThought {
-							hasThought = true
-						} else {
-							hasValidContent = true
-						}
-					}
-					// 检查是否有 file/inlineData
-					if _, ok := content["file"]; ok {
-						hasValidContent = true
-					}
-					if _, ok := content["inlineData"]; ok {
-						hasValidContent = true
-					}
-				}
-			}
-
-			if !hasValidContent {
-				if hasThought {
-					log.Printf("⚠️ [%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retries+1, maxRetries)
-					lastErr = fmt.Errorf("空返回，只有思考内容")
-					retries++
-					continue
-				} else {
-					log.Printf("⚠️ [%s] 响应完全为空 (无 text/file/tool)，重试 (%d/%d)", acc.Data.Email, retries+1, maxRetries)
-					// 打印部分响应以便调试
-					log.Printf("🔍 空响应片段: %s", string(respBody[:min(500, len(respBody))]))
-					lastErr = fmt.Errorf("空返回，无有效内容")
-					retries++
-					continue
-				}
-			}
-		} else {
-			// JSON 解析失败，可能是空响应或其他格式，交给后面逻辑处理
-			// 但这里也可以做一个简单的空检查
-			if len(respBody) == 0 {
-				log.Printf("⚠️ [%s] HTTP 200 但响应体为空，重试 (%d/%d)", acc.Data.Email, retries+1, maxRetries)
-				lastErr = fmt.Errorf("响应体为空")
-				retries++
-				continue
-			}
+		// 检查是否有实际内容（非空返回）
+		hasContent := bytes.Contains(respBody, []byte(`"text"`)) || bytes.Contains(respBody, []byte(`"file"`)) || bytes.Contains(respBody, []byte(`"inlineData"`))
+		if !hasContent && bytes.Contains(respBody, []byte(`"thought"`)) {
+			// 只有思考内容，没有实际输出，重试
+			log.Printf("⚠️ [%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
+			lastErr = fmt.Errorf("空返回，只有思考内容")
+			continue
 		}
 
 		usedJWT = jwt
@@ -1322,6 +1273,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		usedSession = session // 保存创建的 session 作为回退
 		usedAcc = acc
 		lastErr = nil
+		pool.MarkUsed(acc, true) // 标记成功
 		break
 	}
 
@@ -1727,10 +1679,10 @@ func main() {
 		case "--help", "-h":
 			fmt.Println(`用法: ./gemini-gateway [选项]
 
-选项:
-  --debug, -d    调试模式，保存注册过程截图
-  --once         单次注册模式（调试用）
-  --help, -h     显示帮助`)
+				选项:
+				--debug, -d    调试模式，保存注册过程截图
+				--once         单次注册模式（调试用）
+				--help, -h     显示帮助`)
 			os.Exit(0)
 		}
 	}
@@ -1860,21 +1812,150 @@ func main() {
 		})
 	})
 
-	// 获取状态
+	// 获取状态（增强版）
 	admin.GET("/status", func(c *gin.Context) {
+		stats := pool.Stats()
+		stats["target"] = appConfig.Pool.TargetCount
+		stats["min"] = appConfig.Pool.MinCount
+		stats["is_registering"] = atomic.LoadInt32(&isRegistering) == 1
+		stats["register_stats"] = registerStats.Get()
+		c.JSON(200, stats)
+	})
+
+	// 列出所有账号
+	admin.GET("/accounts", func(c *gin.Context) {
+		accounts := pool.ListAccounts()
 		c.JSON(200, gin.H{
-			"ready":          pool.ReadyCount(),
-			"pending":        pool.PendingCount(),
-			"total":          pool.TotalCount(),
-			"target":         appConfig.Pool.TargetCount,
-			"min":            appConfig.Pool.MinCount,
-			"is_registering": atomic.LoadInt32(&isRegistering) == 1,
-			"register_stats": registerStats.Get(),
+			"count":    len(accounts),
+			"accounts": accounts,
 		})
 	})
 
-	log.Printf("🚀 服务启动于 %s，账号: ready=%d, pending=%d", ListenAddr, pool.ReadyCount(), pool.PendingCount())
+	// 强制刷新所有账号
+	admin.POST("/force-refresh", func(c *gin.Context) {
+		count := pool.ForceRefreshAll()
+		c.JSON(200, gin.H{
+			"message": "已触发强制刷新",
+			"count":   count,
+		})
+	})
+
+	// 更新冷却配置
+	admin.POST("/config/cooldown", func(c *gin.Context) {
+		var req struct {
+			RefreshCooldownSec int `json:"refresh_cooldown_sec"`
+			UseCooldownSec     int `json:"use_cooldown_sec"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		SetCooldowns(req.RefreshCooldownSec, req.UseCooldownSec)
+		c.JSON(200, gin.H{
+			"message":              "冷却配置已更新",
+			"refresh_cooldown_sec": int(RefreshCooldown.Seconds()),
+			"use_cooldown_sec":     int(UseCooldown.Seconds()),
+		})
+	})
+
+	// 手动触发浏览器刷新指定账号
+	admin.POST("/browser-refresh", func(c *gin.Context) {
+		var req struct {
+			Email string `json:"email"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+
+		if req.Email == "" {
+			c.JSON(400, gin.H{"error": "需要提供 email"})
+			return
+		}
+
+		// 查找账号
+		accounts := pool.ListAccounts()
+		var targetAcc *Account
+		pool.mu.RLock()
+		for _, acc := range pool.readyAccounts {
+			if acc.Data.Email == req.Email {
+				targetAcc = acc
+				break
+			}
+		}
+		if targetAcc == nil {
+			for _, acc := range pool.pendingAccounts {
+				if acc.Data.Email == req.Email {
+					targetAcc = acc
+					break
+				}
+			}
+		}
+		pool.mu.RUnlock()
+
+		if targetAcc == nil {
+			c.JSON(404, gin.H{"error": "账号未找到", "email": req.Email})
+			return
+		}
+
+		// 执行浏览器刷新
+		go func() {
+			log.Printf(" 手动触发浏览器刷新: %s", req.Email)
+			result := RefreshCookieWithBrowser(targetAcc, BrowserRefreshHeadless, Proxy)
+			if result.Success {
+				targetAcc.mu.Lock()
+				targetAcc.Data.Cookies = result.SecureCookies
+				if result.CSESIDX != "" {
+					targetAcc.CSESIDX = result.CSESIDX
+					targetAcc.Data.CSESIDX = result.CSESIDX
+				}
+				targetAcc.FailCount = 0
+				targetAcc.mu.Unlock()
+
+				if err := targetAcc.SaveToFile(); err != nil {
+					log.Printf(" [%s] 保存刷新后的Cookie失败: %v", req.Email, err)
+				}
+				pool.MarkNeedsRefresh(targetAcc)
+				log.Printf(" 手动浏览器刷新成功: %s", req.Email)
+			} else {
+				log.Printf(" 手动浏览器刷新失败: %s - %v", req.Email, result.Error)
+			}
+		}()
+
+		c.JSON(200, gin.H{
+			"message": "浏览器刷新已触发",
+			"email":   req.Email,
+		})
+		_ = accounts // 避免未使用警告
+	})
+
+	// 切换浏览器刷新开关
+	admin.POST("/config/browser-refresh", func(c *gin.Context) {
+		var req struct {
+			Enable   *bool `json:"enable"`
+			Headless *bool `json:"headless"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+
+		if req.Enable != nil {
+			EnableBrowserRefresh = *req.Enable
+		}
+		if req.Headless != nil {
+			BrowserRefreshHeadless = *req.Headless
+		}
+
+		c.JSON(200, gin.H{
+			"message":  "浏览器刷新配置已更新",
+			"enable":   EnableBrowserRefresh,
+			"headless": BrowserRefreshHeadless,
+		})
+	})
+
+	log.Printf(" 服务启动于 %s，账号: ready=%d, pending=%d", ListenAddr, pool.ReadyCount(), pool.PendingCount())
 	if err := r.Run(ListenAddr); err != nil {
-		log.Fatalf("❌ 服务启动失败: %v", err)
+		log.Fatalf(" 服务启动失败: %v", err)
 	}
 }
