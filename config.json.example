@@ -14,7 +14,8 @@
     "use_cooldown_sec": 15,
     "max_fail_count": 3,
     "enable_browser_refresh": true,
-    "browser_refresh_headless": true
+    "browser_refresh_headless": true,
+    "browser_refresh_max_retry": 0
   },
   "proxy": ""
 }

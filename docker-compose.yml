@@ -2,9 +2,9 @@ version: '3.8'
 
 services:
   business2api:
-    build: .
-    # Or use pre-built image:
-    # image: ghcr.io/xxxteam/business2api:latest
+    image: ghcr.io/XxxXTeam/business2api:latest
+    # 或本地构建: docker compose build
+    # build: .
     container_name: business2api
     restart: unless-stopped
     ports:
@@ -13,13 +13,18 @@ services:
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
     environment:
+      - TZ=Asia/Shanghai
       - LISTEN_ADDR=:8000
       - DATA_DIR=/app/data
       # - PROXY=http://proxy:port
       # - API_KEY=your-api-key
-      # - CONFIG_ID=your-config-id
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/v1/models"]
       interval: 30s
       timeout: 10s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

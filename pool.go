@@ -27,13 +27,51 @@ type Cookie struct {
 
 // AccountData 账号数据
 type AccountData struct {
-	Email         string   `json:"email"`
-	FullName      string   `json:"fullName"`
-	Authorization string   `json:"authorization"`
-	Cookies       []Cookie `json:"cookies"`
-	Timestamp     string   `json:"timestamp"`
-	ConfigID      string   `json:"configId,omitempty"`
-	CSESIDX       string   `json:"csesidx,omitempty"`
+	Email           string            `json:"email"`
+	FullName        string            `json:"fullName"`
+	Authorization   string            `json:"authorization"`
+	Cookies         []Cookie          `json:"cookies"`
+	CookieString    string            `json:"cookie_string,omitempty"`    // 兼容老版本：完整cookie字符串
+	ResponseHeaders map[string]string `json:"response_headers,omitempty"` // 捕获的响应头
+	Timestamp       string            `json:"timestamp"`
+	ConfigID        string            `json:"configId,omitempty"`
+	CSESIDX         string            `json:"csesidx,omitempty"`
+}
+
+// ParseCookieString 解析cookie字符串为Cookie数组（兼容老版本）
+func ParseCookieString(cookieStr string) []Cookie {
+	var cookies []Cookie
+	if cookieStr == "" {
+		return cookies
+	}
+
+	parts := strings.Split(cookieStr, "; ")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(part, "=")
+		if idx > 0 {
+			cookies = append(cookies, Cookie{
+				Name:   part[:idx],
+				Value:  part[idx+1:],
+				Domain: ".gemini.google", // 默认域名
+			})
+		}
+	}
+	return cookies
+}
+
+// GetAllCookies 获取所有cookie（优先使用数组，其次使用字符串）
+func (a *AccountData) GetAllCookies() []Cookie {
+	if len(a.Cookies) > 0 {
+		return a.Cookies
+	}
+	if a.CookieString != "" {
+		return ParseCookieString(a.CookieString)
+	}
+	return nil
 }
 
 // AccountStatus 账号状态
@@ -48,20 +86,21 @@ const (
 
 // Account 账号实例
 type Account struct {
-	Data         AccountData
-	FilePath     string
-	JWT          string
-	JWTExpires   time.Time
-	ConfigID     string
-	CSESIDX      string
-	LastRefresh  time.Time
-	LastUsed     time.Time // 最后使用时间
-	Refreshed    bool
-	FailCount    int // 连续失败次数
-	SuccessCount int // 成功次数
-	TotalCount   int // 总使用次数
-	Status       AccountStatus
-	mu           sync.Mutex
+	Data                AccountData
+	FilePath            string
+	JWT                 string
+	JWTExpires          time.Time
+	ConfigID            string
+	CSESIDX             string
+	LastRefresh         time.Time
+	LastUsed            time.Time // 最后使用时间
+	Refreshed           bool
+	FailCount           int // 连续失败次数
+	BrowserRefreshCount int // 浏览器刷新尝试次数
+	SuccessCount        int // 成功次数
+	TotalCount          int // 总使用次数
+	Status              AccountStatus
+	mu                  sync.Mutex
 }
 
 // 默认冷却时间（可通过配置覆盖）
@@ -72,6 +111,7 @@ var (
 	MaxFailCount           = 3                // 最大连续失败次数
 	EnableBrowserRefresh   = true             // 是否启用浏览器刷新
 	BrowserRefreshHeadless = true             // 浏览器刷新是否无头模式
+	BrowserRefreshMaxRetry = 1                // 浏览器刷新最大重试次数
 )
 
 type AccountPool struct {
@@ -233,6 +273,16 @@ func (acc *Account) SaveToFile() error {
 	defer acc.mu.Unlock()
 
 	acc.Data.Timestamp = time.Now().Format(time.RFC3339)
+
+	// 同时生成 cookie 字符串（方便调试和兼容老版本）
+	if len(acc.Data.Cookies) > 0 {
+		var cookieParts []string
+		for _, c := range acc.Data.Cookies {
+			cookieParts = append(cookieParts, fmt.Sprintf("%s=%s", c.Name, c.Value))
+		}
+		acc.Data.CookieString = strings.Join(cookieParts, "; ")
+	}
+
 	data, err := json.MarshalIndent(acc.Data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化账号数据失败: %w", err)
@@ -286,9 +336,18 @@ func (p *AccountPool) refreshWorker(id int) {
 				strings.Contains(errMsg, "403") {
 				log.Printf("⚠️ [worker-%d] [%s] 认证失效: %v", id, acc.Data.Email, err)
 
-				// 尝试浏览器刷新
-				if EnableBrowserRefresh {
-					log.Printf("🌐 [worker-%d] [%s] 尝试浏览器刷新Cookie...", id, acc.Data.Email)
+				// 检查是否可以进行浏览器刷新
+				acc.mu.Lock()
+				browserRefreshCount := acc.BrowserRefreshCount
+				acc.mu.Unlock()
+
+				// 尝试浏览器刷新（有次数限制）
+				if EnableBrowserRefresh && BrowserRefreshMaxRetry > 0 && browserRefreshCount < BrowserRefreshMaxRetry {
+					acc.mu.Lock()
+					acc.BrowserRefreshCount++
+					acc.mu.Unlock()
+
+					log.Printf("🌐 [worker-%d] [%s] 尝试浏览器刷新 (%d/%d)...", id, acc.Data.Email, browserRefreshCount+1, BrowserRefreshMaxRetry)
 					refreshResult := RefreshCookieWithBrowser(acc, BrowserRefreshHeadless, Proxy)
 
 					if refreshResult.Success {
@@ -306,7 +365,12 @@ func (p *AccountPool) refreshWorker(id int) {
 							acc.CSESIDX = refreshResult.CSESIDX
 							acc.Data.CSESIDX = refreshResult.CSESIDX
 						}
+						// 保存响应头（用于调试和追踪）
+						if len(refreshResult.ResponseHeaders) > 0 {
+							acc.Data.ResponseHeaders = refreshResult.ResponseHeaders
+						}
 						acc.FailCount = 0
+						acc.BrowserRefreshCount = 0  // 成功后重置计数
 						acc.JWTExpires = time.Time{} // 重置JWT过期时间
 						acc.Status = StatusPending
 						acc.mu.Unlock()
@@ -322,11 +386,13 @@ func (p *AccountPool) refreshWorker(id int) {
 						p.mu.Unlock()
 						continue
 					} else {
-						log.Printf("⚠️ [worker-%d] [%s] 浏览器重新登录失败: %v", id, acc.Data.Email, refreshResult.Error)
+						log.Printf("⚠️ [worker-%d] [%s] 浏览器刷新失败: %v", id, acc.Data.Email, refreshResult.Error)
 					}
+				} else if browserRefreshCount >= BrowserRefreshMaxRetry && BrowserRefreshMaxRetry > 0 {
+					log.Printf("⚠️ [worker-%d] [%s] 已达浏览器刷新上限 (%d次)，跳过浏览器刷新", id, acc.Data.Email, BrowserRefreshMaxRetry)
 				}
 
-				// 浏览器刷新失败或未启用：累计失败次数，稍后重试（不删除账号）
+				// 浏览器刷新失败或已达上限：累计失败次数，稍后重试（不删除账号）
 				acc.mu.Lock()
 				acc.FailCount++
 				failCount := acc.FailCount

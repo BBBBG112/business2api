@@ -33,3 +33,5 @@ build/
 data/
 config.json
 package-lock.json
+main.js
+package.json

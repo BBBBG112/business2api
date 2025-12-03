@@ -29,17 +29,18 @@ import (
 // ==================== 配置结构 ====================
 
 type PoolConfig struct {
-	TargetCount            int  `json:"target_count"`             // 目标账号数量
-	MinCount               int  `json:"min_count"`                // 最小账号数，低于此值触发注册
-	CheckIntervalMinutes   int  `json:"check_interval_minutes"`   // 检查间隔(分钟)
-	RegisterThreads        int  `json:"register_threads"`         // 注册线程数
-	RegisterHeadless       bool `json:"register_headless"`        // 无头模式
-	RefreshOnStartup       bool `json:"refresh_on_startup"`       // 启动时刷新账号
-	RefreshCooldownSec     int  `json:"refresh_cooldown_sec"`     // 刷新冷却时间(秒)
-	UseCooldownSec         int  `json:"use_cooldown_sec"`         // 使用冷却时间(秒)
-	MaxFailCount           int  `json:"max_fail_count"`           // 最大连续失败次数
-	EnableBrowserRefresh   bool `json:"enable_browser_refresh"`   // 启用浏览器刷新401账号
-	BrowserRefreshHeadless bool `json:"browser_refresh_headless"` // 浏览器刷新无头模式
+	TargetCount            int  `json:"target_count"`              // 目标账号数量
+	MinCount               int  `json:"min_count"`                 // 最小账号数，低于此值触发注册
+	CheckIntervalMinutes   int  `json:"check_interval_minutes"`    // 检查间隔(分钟)
+	RegisterThreads        int  `json:"register_threads"`          // 注册线程数
+	RegisterHeadless       bool `json:"register_headless"`         // 无头模式
+	RefreshOnStartup       bool `json:"refresh_on_startup"`        // 启动时刷新账号
+	RefreshCooldownSec     int  `json:"refresh_cooldown_sec"`      // 刷新冷却时间(秒)
+	UseCooldownSec         int  `json:"use_cooldown_sec"`          // 使用冷却时间(秒)
+	MaxFailCount           int  `json:"max_fail_count"`            // 最大连续失败次数
+	EnableBrowserRefresh   bool `json:"enable_browser_refresh"`    // 启用浏览器刷新401账号
+	BrowserRefreshHeadless bool `json:"browser_refresh_headless"`  // 浏览器刷新无头模式
+	BrowserRefreshMaxRetry int  `json:"browser_refresh_max_retry"` // 浏览器刷新最大重试次数(0=禁用)
 }
 
 type AppConfig struct {
@@ -66,6 +67,7 @@ var appConfig = AppConfig{
 		MaxFailCount:           3,
 		EnableBrowserRefresh:   true, // 默认启用浏览器刷新
 		BrowserRefreshHeadless: true,
+		BrowserRefreshMaxRetry: 1, // 浏览器刷新最多重试1次
 	},
 }
 
@@ -134,9 +136,15 @@ func loadAppConfig() {
 	}
 	EnableBrowserRefresh = appConfig.Pool.EnableBrowserRefresh
 	BrowserRefreshHeadless = appConfig.Pool.BrowserRefreshHeadless
+	if appConfig.Pool.BrowserRefreshMaxRetry >= 0 {
+		BrowserRefreshMaxRetry = appConfig.Pool.BrowserRefreshMaxRetry
+	}
 
-	if EnableBrowserRefresh {
-		log.Printf("🌐 浏览器刷新已启用 (headless=%v)", BrowserRefreshHeadless)
+	if EnableBrowserRefresh && BrowserRefreshMaxRetry > 0 {
+		log.Printf("🌐 浏览器刷新已启用 (headless=%v, 最大重试=%d)", BrowserRefreshHeadless, BrowserRefreshMaxRetry)
+	} else if EnableBrowserRefresh {
+		log.Printf("🌐 浏览器刷新已禁用 (max_retry=0)")
+		EnableBrowserRefresh = false
 	}
 }
 
@@ -804,6 +812,14 @@ func downloadMedia(urlStr, mediaType string) (string, string, error) {
 	}
 	defer resp.Body.Close()
 
+	// 检查上游返回的状态码
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return "", "", fmt.Errorf("UPSTREAM_%d: 上游返回状态码 %d 多媒体下载失败", resp.StatusCode, resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		return "", "", fmt.Errorf("UPSTREAM_%d: 上游返回状态码 %d", resp.StatusCode, resp.StatusCode)
+	}
+
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", "", err
@@ -1101,6 +1117,43 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	var usedAcc *Account
 	var usedJWT, usedOrigAuth, usedConfigID, usedSession string
 
+	// 检测是否是可能长时间处理的模型（视频/图片生成）
+	isLongRunning := !req.Stream && (strings.Contains(req.Model, "video") ||
+		strings.Contains(req.Model, "imagen") ||
+		strings.Contains(req.Model, "image"))
+
+	// 对于非流式的长时间任务，启动心跳保持连接
+	var heartbeatDone chan struct{}
+	if isLongRunning {
+		heartbeatDone = make(chan struct{})
+		c.Header("Content-Type", "application/json")
+		c.Header("Transfer-Encoding", "chunked")
+		c.Status(200)
+		writer := c.Writer
+		flusher, ok := writer.(http.Flusher)
+		if ok {
+			flusher.Flush() // 先发送头部
+		}
+
+		// 启动心跳 goroutine
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-heartbeatDone:
+					return
+				case <-ticker.C:
+					// 发送空格作为心跳（不影响 JSON 解析）
+					writer.Write([]byte(" "))
+					if flusher, ok := writer.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				}
+			}
+		}()
+	}
+
 	for retry := 0; retry < maxRetries; retry++ {
 		acc := pool.Next()
 		if acc == nil {
@@ -1152,16 +1205,22 @@ func streamChat(c *gin.Context, req ChatRequest) {
 					mediaData, mimeType, dlErr := downloadMedia(media.URL, media.MediaType)
 					if dlErr != nil {
 						log.Printf("⚠️ [%s] %s下载失败: %v", acc.Data.Email, mediaTypeName, dlErr)
+						if strings.Contains(dlErr.Error(), "UPSTREAM_401") || strings.Contains(dlErr.Error(), "UPSTREAM_403") {
+							c.JSON(500, gin.H{"error": gin.H{
+								"message": dlErr.Error(),
+								"type":    "upstream_error",
+								"code":    "media_download_failed",
+							}})
+							return
+						}
 						uploadFailed = true
 						break
 					}
 					fileId, err = uploadContextFile(jwt, configID, session, mimeType, mediaData, acc.Data.Authorization)
 				}
 			} else {
-				// base64 数据直接上传
 				fileId, err = uploadContextFile(jwt, configID, session, media.MimeType, media.Data, acc.Data.Authorization)
 			}
-
 			if err != nil {
 				log.Printf("⚠️ [%s] %s上传失败: %v", acc.Data.Email, mediaTypeName, err)
 				uploadFailed = true
@@ -1173,7 +1232,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			lastErr = fmt.Errorf("媒体上传失败")
 			continue
 		}
-
 		// 构建 query parts（只包含文本）
 		queryParts := []map[string]interface{}{}
 		if textContent != "" {
@@ -1235,12 +1293,18 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				log.Printf("⚠️ [%s] %d 无权限，标记需要刷新", acc.Data.Email, resp.StatusCode)
 				pool.MarkNeedsRefresh(acc)
 			}
-			// 429 限流，延长使用冷却时间
+			// 429 限流，延长使用冷却时间（3倍冷却）
 			if resp.StatusCode == 429 {
+				cooldownTime := UseCooldown * 3
 				acc.mu.Lock()
-				acc.LastUsed = time.Now().Add(UseCooldown) // 延长冷却
+				acc.LastUsed = time.Now().Add(cooldownTime)
 				acc.mu.Unlock()
-				log.Printf("⏳ [%s] 429 限流，账号进入延长冷却", acc.Data.Email)
+				log.Printf("⏳ [%s] 429 限流，账号进入延长冷却 %v", acc.Data.Email, cooldownTime)
+				// 429不计入重试次数，等待后继续尝试其他账号
+				pool.MarkUsed(acc, false)
+				time.Sleep(1 * time.Second) // 短暂等待后切换账号
+				retry--                     // 不计入重试次数
+				continue
 			}
 			pool.MarkUsed(acc, false) // 标记失败
 			continue
@@ -1543,6 +1607,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		fmt.Fprintf(writer, "data: [DONE]\n\n")
 		flusher.Flush()
 	} else {
+		// 非流式响应
 		var fullContent strings.Builder
 		var fullReasoning strings.Builder
 		replyCount := 0
@@ -1607,7 +1672,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			message["content"] = nil
 			finishReason = "tool_calls"
 		}
-		c.JSON(200, gin.H{
+
+		// 构建最终响应
+		response := gin.H{
 			"id":      chatID,
 			"object":  "chat.completion",
 			"created": createdTime,
@@ -1622,7 +1689,16 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				"completion_tokens": 0,
 				"total_tokens":      0,
 			},
-		})
+		}
+
+		// 对于长时间运行的模型，停止心跳后直接写入 JSON
+		if isLongRunning && heartbeatDone != nil {
+			close(heartbeatDone) // 停止心跳
+			jsonBytes, _ := json.Marshal(response)
+			c.Writer.Write(jsonBytes)
+		} else {
+			c.JSON(200, response)
+		}
 	}
 }
 func apiKeyAuth() gin.HandlerFunc {
@@ -1664,11 +1740,117 @@ func apiKeyAuth() gin.HandlerFunc {
 		c.Next()
 	}
 }
+
+// runBrowserRefreshMode 有头浏览器刷新模式
+func runBrowserRefreshMode(email string) {
+	loadAppConfig()
+	initHTTPClient()
+
+	// 强制有头模式
+	BrowserRefreshHeadless = false
+	log.Println("🌐 有头浏览器刷新模式")
+
+	if err := pool.Load(DataDir); err != nil {
+		log.Fatalf("❌ 加载账号失败: %v", err)
+	}
+
+	if pool.TotalCount() == 0 {
+		log.Fatal("❌ 没有可用账号")
+	}
+
+	// 查找目标账号
+	var targetAcc *Account
+	pool.mu.RLock()
+	if email != "" {
+		// 指定邮箱
+		for _, acc := range pool.readyAccounts {
+			if acc.Data.Email == email {
+				targetAcc = acc
+				break
+			}
+		}
+		if targetAcc == nil {
+			for _, acc := range pool.pendingAccounts {
+				if acc.Data.Email == email {
+					targetAcc = acc
+					break
+				}
+			}
+		}
+	} else {
+		// 使用第一个账号
+		if len(pool.readyAccounts) > 0 {
+			targetAcc = pool.readyAccounts[0]
+		} else if len(pool.pendingAccounts) > 0 {
+			targetAcc = pool.pendingAccounts[0]
+		}
+	}
+	pool.mu.RUnlock()
+
+	if targetAcc == nil {
+		if email != "" {
+			log.Fatalf("❌ 找不到账号: %s", email)
+		}
+		log.Fatal("❌ 没有可用账号")
+	}
+
+	log.Printf("📧 目标账号: %s", targetAcc.Data.Email)
+	log.Printf("🔧 ConfigID: %s", targetAcc.Data.ConfigID)
+	log.Printf("🔧 CSESIDX: %s", targetAcc.CSESIDX)
+	log.Println("🚀 启动浏览器刷新...")
+
+	result := RefreshCookieWithBrowser(targetAcc, false, Proxy)
+
+	if result.Success {
+		log.Println("✅ 刷新成功!")
+		log.Printf("   Authorization: %s...", result.Authorization[:50])
+		log.Printf("   Cookies: %d 个", len(result.SecureCookies))
+		if len(result.NewCookies) > 0 {
+			log.Printf("   新Cookie: %d 个", len(result.NewCookies))
+		}
+		if len(result.ResponseHeaders) > 0 {
+			log.Printf("   捕获响应头: %d 个", len(result.ResponseHeaders))
+		}
+
+		// 更新账号数据
+		targetAcc.mu.Lock()
+		targetAcc.Data.Cookies = result.SecureCookies
+		if result.Authorization != "" {
+			targetAcc.Data.Authorization = result.Authorization
+		}
+		if result.ConfigID != "" {
+			targetAcc.ConfigID = result.ConfigID
+			targetAcc.Data.ConfigID = result.ConfigID
+		}
+		if result.CSESIDX != "" {
+			targetAcc.CSESIDX = result.CSESIDX
+			targetAcc.Data.CSESIDX = result.CSESIDX
+		}
+		// 保存响应头
+		if len(result.ResponseHeaders) > 0 {
+			targetAcc.Data.ResponseHeaders = result.ResponseHeaders
+		}
+		targetAcc.mu.Unlock()
+
+		// 保存到文件
+		if err := targetAcc.SaveToFile(); err != nil {
+			log.Printf("⚠️ 保存失败: %v", err)
+		} else {
+			log.Printf("💾 已保存到: %s", targetAcc.FilePath)
+		}
+	} else {
+		log.Printf("❌ 刷新失败: %v", result.Error)
+	}
+}
+
 func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 
+	var refreshEmail string
+	var refreshMode bool
+
 	// 解析命令行参数
-	for _, arg := range os.Args[1:] {
+	for i, arg := range os.Args[1:] {
 		switch arg {
 		case "--debug", "-d":
 			RegisterDebug = true
@@ -1676,15 +1858,28 @@ func main() {
 		case "--once":
 			RegisterOnce = true
 			log.Println("🔧 单次运行模式")
+		case "--refresh":
+			refreshMode = true
+			// 检查下一个参数是否是邮箱
+			if i+2 < len(os.Args) && !strings.HasPrefix(os.Args[i+2], "-") {
+				refreshEmail = os.Args[i+2]
+			}
 		case "--help", "-h":
 			fmt.Println(`用法: ./gemini-gateway [选项]
 
-				选项:
-				--debug, -d    调试模式，保存注册过程截图
-				--once         单次注册模式（调试用）
-				--help, -h     显示帮助`)
+选项:
+  --debug, -d           调试模式，保存注册过程截图
+  --once                单次注册模式（调试用）
+  --refresh [email]     有头浏览器刷新账号（不指定email则使用第一个账号）
+  --help, -h            显示帮助`)
 			os.Exit(0)
 		}
+	}
+
+	// 刷新模式：直接执行浏览器刷新后退出
+	if refreshMode {
+		runBrowserRefreshMode(refreshEmail)
+		return
 	}
 
 	loadAppConfig()

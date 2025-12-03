@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,17 +20,12 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// ==================== 浏览器自动化注册 ====================
-
 var (
-	// RegisterDebug 调试模式（截图）
 	RegisterDebug bool
-	// RegisterOnce 单次运行模式（调试用）
-	RegisterOnce bool
-
-	firstNames  = []string{"John", "Jane", "Michael", "Sarah", "David", "Emily", "Robert", "Lisa", "James", "Emma"}
-	lastNames   = []string{"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Wilson", "Taylor"}
-	commonWords = map[string]bool{
+	RegisterOnce  bool
+	firstNames    = []string{"John", "Jane", "Michael", "Sarah", "David", "Emily", "Robert", "Lisa", "James", "Emma"}
+	lastNames     = []string{"Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Wilson", "Taylor"}
+	commonWords   = map[string]bool{
 		"VERIFY": true, "GOOGLE": true, "UPDATE": true, "MOBILE": true, "DEVICE": true,
 		"SUBMIT": true, "RESEND": true, "CANCEL": true, "DELETE": true, "REMOVE": true,
 		"SEARCH": true, "VIDEOS": true, "IMAGES": true, "GMAIL": true, "EMAIL": true,
@@ -98,7 +94,6 @@ var tempMailProviders = []TempMailProvider{
 	// 备用邮箱服务可以在这里添加
 }
 
-// getTemporaryEmail 获取临时邮箱（支持多个提供商）
 func getTemporaryEmail() (string, error) {
 	var lastErr error
 
@@ -109,14 +104,11 @@ func getTemporaryEmail() (string, error) {
 			log.Printf("⚠️ 临时邮箱 %s 失败: %v，尝试下一个", provider.Name, err)
 			continue
 		}
-		log.Printf("✅ 获取临时邮箱成功 (%s): %s", provider.Name, email)
 		return email, nil
 	}
 
 	return "", fmt.Errorf("所有临时邮箱服务均失败: %v", lastErr)
 }
-
-// getEmailFromProvider 从指定提供商获取邮箱
 func getEmailFromProvider(provider TempMailProvider) (string, error) {
 	req, _ := http.NewRequest("GET", provider.GenerateURL, nil)
 	for k, v := range provider.Headers {
@@ -473,41 +465,34 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	if needsVerification {
 
 		var emailContent *EmailContent
-		maxResendAttempts := 3
+		maxWaitTime := 3 * time.Minute
+		startTime := time.Now()
+		clickCount := 0
 
-		for resendAttempt := 0; resendAttempt < maxResendAttempts; resendAttempt++ {
-			emailContent, _ = getVerificationEmailQuick(email, 20, 2)
+		for time.Since(startTime) < maxWaitTime {
+			// 尝试点击重发按钮
+			clickResult, _ := page.Eval(`() => {
+				// 精确匹配: <span jsname="V67aGc" class="YuMlnb-vQzf8d">重新发送验证码</span>
+				const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
+				            document.querySelector('span.YuMlnb-vQzf8d');
+				
+				if (btn && btn.textContent.includes('重新发送')) {
+					btn.click();
+					if (btn.parentElement) btn.parentElement.click();
+					return {clicked: true};
+				}
+				return {clicked: false};
+			}`)
 
-			if emailContent != nil {
-				break
+			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+				clickCount++
+				time.Sleep(1 * time.Second)
 			}
 
-			// 尝试点击重发
-			if resendAttempt < maxResendAttempts-1 {
-				debugScreenshot(page, threadID, fmt.Sprintf("05_no_code_attempt%d", resendAttempt+1))
-				page.Eval(`() => {
-					const resendTexts = ['重新发送', 'Resend', 'resend', '重发', 'Send again', '再次发送', '发送'];
-					const elements = [
-						...document.querySelectorAll('a'),
-						...document.querySelectorAll('button'),
-						...document.querySelectorAll('span'),
-						...document.querySelectorAll('div[role="button"]')
-					];
-					
-					for (const element of elements) {
-						if (!element) continue;
-						const text = element.textContent ? element.textContent.trim() : '';
-						const style = window.getComputedStyle(element);
-						if (style.display === 'none' || style.visibility === 'hidden') continue;
-						
-						if (text && resendTexts.some(t => text.toLowerCase().includes(t.toLowerCase()))) {
-							element.click();
-							return true;
-						}
-					}
-					return false;
-				}`)
-				time.Sleep(2 * time.Second)
+			// 快速检查邮件
+			emailContent, _ = getVerificationEmailQuick(email, 1, 1)
+			if emailContent != nil {
+				break
 			}
 		}
 
@@ -690,17 +675,47 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		result.Error = fmt.Errorf("未能获取 Authorization")
 		return result
 	}
-
-	// 获取 cookies
-	cookies, _ := page.Cookies(nil)
 	var resultCookies []Cookie
+	cookieMap := make(map[string]bool)
+
+	// 获取当前页面所有 cookie
+	cookies, _ := page.Cookies(nil)
 	for _, c := range cookies {
-		resultCookies = append(resultCookies, Cookie{
-			Name:   c.Name,
-			Value:  c.Value,
-			Domain: c.Domain,
-		})
+		key := c.Name + "|" + c.Domain
+		if !cookieMap[key] {
+			cookieMap[key] = true
+			resultCookies = append(resultCookies, Cookie{
+				Name:   c.Name,
+				Value:  c.Value,
+				Domain: c.Domain,
+			})
+		}
 	}
+
+	// 尝试从特定域名获取更多 cookie
+	domains := []string{
+		"https://business.gemini.google",
+		"https://gemini.google",
+		"https://accounts.google.com",
+	}
+	for _, domain := range domains {
+		domainCookies, err := page.Cookies([]string{domain})
+		if err == nil {
+			for _, c := range domainCookies {
+				key := c.Name + "|" + c.Domain
+				if !cookieMap[key] {
+					cookieMap[key] = true
+					resultCookies = append(resultCookies, Cookie{
+						Name:   c.Name,
+						Value:  c.Value,
+						Domain: c.Domain,
+					})
+				}
+			}
+		}
+	}
+
+	log.Printf("[注册 %d] 获取到 %d 个 Cookie", threadID, len(resultCookies))
 
 	result.Success = true
 	result.Authorization = authorization
@@ -745,12 +760,14 @@ func SaveBrowserRegisterResult(result *BrowserRegisterResult, dataDir string) er
 
 // BrowserRefreshResult Cookie刷新结果
 type BrowserRefreshResult struct {
-	Success       bool
-	SecureCookies []Cookie
-	ConfigID      string
-	CSESIDX       string
-	Authorization string
-	Error         error
+	Success         bool
+	SecureCookies   []Cookie
+	ConfigID        string
+	CSESIDX         string
+	Authorization   string
+	ResponseHeaders map[string]string // 捕获的响应头
+	NewCookies      []Cookie          // 从响应头提取的新Cookie
+	Error           error
 }
 
 // RefreshCookieWithBrowser 使用浏览器重新登录刷新Cookie（用于401账号）
@@ -825,9 +842,47 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	})
 
-	// 监听请求以捕获 authorization
+	// 监听请求和响应以捕获 authorization 和响应头
 	var authorization string
 	var configID, csesidx string
+	var responseHeadersMu sync.Mutex
+	responseHeaders := make(map[string]string)
+	var newCookiesFromResponse []Cookie
+
+	// 监听响应以捕获 Set-Cookie 等头信息
+	go page.EachEvent(func(e *proto.NetworkResponseReceived) {
+		responseHeadersMu.Lock()
+		defer responseHeadersMu.Unlock()
+
+		// 获取响应头中的重要信息 - Headers 是 map[string]gson.JSON 类型
+		headers := e.Response.Headers
+		importantKeys := []string{"set-cookie", "Set-Cookie", "authorization", "Authorization",
+			"x-goog-authenticated-user", "X-Goog-Authenticated-User"}
+
+		for _, key := range importantKeys {
+			if val, ok := headers[key]; ok {
+				str := val.Str()
+				if str == "" {
+					continue
+				}
+				responseHeaders[key] = str
+				// 解析 Set-Cookie
+				if strings.ToLower(key) == "set-cookie" {
+					parts := strings.Split(str, ";")
+					if len(parts) > 0 {
+						nv := strings.SplitN(parts[0], "=", 2)
+						if len(nv) == 2 {
+							newCookiesFromResponse = append(newCookiesFromResponse, Cookie{
+								Name:   strings.TrimSpace(nv[0]),
+								Value:  strings.TrimSpace(nv[1]),
+								Domain: ".gemini.google",
+							})
+						}
+					}
+				}
+			}
+		}
+	})()
 
 	go page.EachEvent(func(e *proto.NetworkRequestWillBeSent) {
 		if auth, ok := e.Request.Headers["authorization"]; ok {
@@ -844,30 +899,69 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		}
 	})()
 
-	// 先访问目标域名以便设置Cookie
-	page.Navigate("https://business.gemini.google")
-	page.WaitLoad()
-	time.Sleep(500 * time.Millisecond)
-
-	// 注入老的Cookie
-	existingCookies := acc.Data.Cookies
+	// 注入关键 Cookie（使用 CDP Storage.setCookies）
+	existingCookies := acc.Data.GetAllCookies()
 	if len(existingCookies) > 0 {
 		log.Printf("[Cookie刷新] [%s] 注入 %d 个现有Cookie", email, len(existingCookies))
+
 		for _, c := range existingCookies {
-			cookie := &proto.NetworkCookieParam{
-				Name:   c.Name,
-				Value:  c.Value,
-				Domain: c.Domain,
-				Path:   "/",
-				Secure: true,
+			var url, domain string
+
+			// 根据 cookie 名称和原始域名确定正确的设置方式
+			switch {
+			case strings.HasPrefix(c.Name, "__Host-"):
+				// __Host- cookie 必须使用 URL 方式设置，不能设置 Domain
+				url = "https://business.gemini.google/"
+				domain = ""
+			case strings.HasPrefix(c.Name, "__Secure-"):
+				// __Secure- cookie
+				url = "https://business.gemini.google/"
+				domain = "business.gemini.google"
+			case c.Domain != "":
+				domain = c.Domain
+				if strings.HasSuffix(c.Domain, "gemini.google") {
+					url = "https://business.gemini.google/"
+				}
+			default:
+				domain = ".gemini.google"
+				url = "https://business.gemini.google/"
 			}
-			page.SetCookies([]*proto.NetworkCookieParam{cookie})
+
+			cookie := &proto.NetworkCookieParam{
+				Name:     c.Name,
+				Value:    c.Value,
+				Path:     "/",
+				Secure:   true,
+				SameSite: proto.NetworkCookieSameSiteNone,
+			}
+			if url != "" {
+				cookie.URL = url
+			}
+			if domain != "" {
+				cookie.Domain = domain
+			}
+
+			err := page.SetCookies([]*proto.NetworkCookieParam{cookie})
+			status := "✓"
+			if err != nil {
+				status = fmt.Sprintf("✗ %v", err)
+			}
+			log.Printf("[Cookie刷新] [%s]   %s %s = %s... (url: %s, domain: %s)",
+				email, status, c.Name, c.Value[:min(20, len(c.Value))], url, domain)
 		}
 	}
 
-	// 刷新页面让Cookie生效
-	log.Printf("[Cookie刷新] [%s] 刷新页面...", email)
-	page.Reload()
+	// 导航到目标页面（带 csesidx 参数）
+	csesidxParam := acc.CSESIDX
+	if csesidxParam == "" {
+		csesidxParam = acc.Data.CSESIDX
+	}
+	targetURL := "https://business.gemini.google/"
+	if csesidxParam != "" {
+		targetURL = fmt.Sprintf("https://business.gemini.google/?csesidx=%s", csesidxParam)
+	}
+	log.Printf("[Cookie刷新] [%s] 导航到: %s", email, targetURL)
+	page.Navigate(targetURL)
 	page.WaitLoad()
 	time.Sleep(2 * time.Second)
 
@@ -927,44 +1021,63 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		time.Sleep(2 * time.Second)
 	}
 
-	// 等待并获取验证码邮件
-	log.Printf("[Cookie刷新] [%s] 等待验证码邮件...", email)
+	// 等待验证码发送
+	log.Printf("[Cookie刷新] [%s] 等待验证码发送...", email)
+	time.Sleep(3 * time.Second)
+
+	// 等待并获取验证码邮件（持续点击重发按钮）
+	log.Printf("[Cookie刷新] [%s] 开始查询验证码邮件...", email)
 	{
 		var emailContent *EmailContent
-		for attempt := 0; attempt < 3; attempt++ {
-			emailContent, _ = getVerificationEmailQuick(email, 20, 2)
+		maxWaitTime := 3 * time.Minute
+		startTime := time.Now()
+		clickCount := 0
+
+		for time.Since(startTime) < maxWaitTime {
+			// 尝试点击重发按钮 - 精确选择器
+			clickResult, _ := page.Eval(`() => {
+				// 精确匹配: <span jsname="V67aGc" class="YuMlnb-vQzf8d">重新发送验证码</span>
+				const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
+				            document.querySelector('span.YuMlnb-vQzf8d');
+				
+				if (btn && btn.textContent.includes('重新发送')) {
+					// 点击按钮及其所有父元素
+					btn.click();
+					let parent = btn.parentElement;
+					while (parent && parent !== document.body) {
+						parent.click();
+						parent = parent.parentElement;
+					}
+					return {clicked: true};
+				}
+				return {clicked: false};
+			}`)
+
+			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+				clickCount++
+				time.Sleep(1 * time.Second) // 点击后等待1秒
+			}
+
+			// 快速检查邮件
+			emailContent, _ = getVerificationEmailQuick(email, 1, 1) // 1次*1秒
 			if emailContent != nil {
 				break
 			}
-			// 尝试点击重发
-			if attempt < 2 {
-				page.Eval(`() => {
-					const texts = ['重新发送', 'Resend', '重发', 'Send again'];
-					const els = [...document.querySelectorAll('a'), ...document.querySelectorAll('button'), ...document.querySelectorAll('span')];
-					for (const el of els) {
-						if (!el) continue;
-						const text = el.textContent ? el.textContent.trim() : '';
-						if (text && texts.some(t => text.toLowerCase().includes(t.toLowerCase()))) { el.click(); return true; }
-					}
-					return false;
-				}`)
-				time.Sleep(2 * time.Second)
-			}
+
+			log.Printf("[Cookie刷新] [%s] 等待邮件... (已等待 %v)", email, time.Since(startTime).Round(time.Second))
 		}
 
 		if emailContent == nil {
 			result.Error = fmt.Errorf("无法获取验证码邮件")
 			return result
 		}
-
 		// 提取验证码
 		code, err := extractVerificationCode(emailContent.Content)
 		if err != nil {
+			log.Printf("[Cookie刷新] [%s] 提取验证码失败，邮件可能是旧邮件: %v", email, err)
 			result.Error = err
 			return result
 		}
-		log.Printf("[Cookie刷新] [%s] 获取到验证码: %s", email, code)
-
 		// 输入验证码
 		time.Sleep(500 * time.Millisecond)
 		page.Eval(`() => {
@@ -1041,16 +1154,44 @@ extractResult:
 		return result
 	}
 
-	// 获取cookies
+	// 获取cookies - 合并浏览器cookie和响应头中的cookie
 	cookies, _ := page.Cookies(nil)
-	var resultCookies []Cookie
+	cookieMap := make(map[string]Cookie) // 用于去重，后添加的会覆盖先添加的
+
+	// 先添加原有的 cookie（作为基础）
+	for _, c := range acc.Data.GetAllCookies() {
+		cookieMap[c.Name] = c
+	}
+
+	// 再添加浏览器获取的 cookie（会覆盖旧的）
 	for _, c := range cookies {
-		resultCookies = append(resultCookies, Cookie{
+		cookieMap[c.Name] = Cookie{
 			Name:   c.Name,
 			Value:  c.Value,
 			Domain: c.Domain,
-		})
+		}
 	}
+
+	// 最后添加从响应头获取的新 cookie（最高优先级）
+	responseHeadersMu.Lock()
+	for _, c := range newCookiesFromResponse {
+		cookieMap[c.Name] = c
+	}
+	// 复制响应头
+	result.ResponseHeaders = make(map[string]string)
+	for k, v := range responseHeaders {
+		result.ResponseHeaders[k] = v
+	}
+	result.NewCookies = newCookiesFromResponse
+	responseHeadersMu.Unlock()
+
+	// 转换为数组
+	var resultCookies []Cookie
+	for _, c := range cookieMap {
+		resultCookies = append(resultCookies, c)
+	}
+
+	log.Printf("[Cookie刷新] [%s] 合并后 %d 个Cookie (新增 %d 个)", email, len(resultCookies), len(newCookiesFromResponse))
 
 	// 从URL提取最终信息
 	info, _ = page.Info()
