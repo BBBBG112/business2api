@@ -1629,7 +1629,8 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		if hasToolCalls {
 			finishReason = "tool_calls"
 		}
-		finalChunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{}, &finishReason)
+		// 最终chunk必须包含非空delta，否则某些客户端会报"delta/message is null"
+		finalChunk := createChunk(chatID, createdTime, req.Model, nil, &finishReason)
 		fmt.Fprintf(writer, "data: %s\n\n", finalChunk)
 		fmt.Fprintf(writer, "data: [DONE]\n\n")
 		flusher.Flush()
