@@ -71,16 +71,24 @@ socks5://127.0.0.1:1080
   "enable": false,                 // 是否启用
   "mode": "local",                 // 模式: local/server/client
   "server_addr": "",               // 服务器地址 (客户端模式)
+  "listen_addr": ":8000",          // 监听地址 (服务器模式)
   "secret": "",                    // 认证密钥
   "target_count": 50,              // 目标账号数
-  "data_dir": "./data"             // 数据目录
+  "client_threads": 2,             // 客户端并发线程数
+  "data_dir": "./data",            // 数据目录
+  "expired_action": "delete"       // 过期账号处理方式
 }
 ```
 
 **模式说明**:
 - `local`: 本地模式，独立运行
-- `server`: 服务器模式，提供号池服务
-- `client`: 客户端模式，连接远程号池服务器
+- `server`: 服务器模式，提供号池服务和API
+- `client`: 客户端模式，连接服务器接收注册/续期任务
+
+**expired_action 说明**:
+- `delete`: 删除过期/失败账号
+- `refresh`: 尝试浏览器刷新Cookie
+- `queue`: 保留在队列等待重试
 
 ---
 

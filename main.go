@@ -488,6 +488,12 @@ func initFlowClient() {
 }
 
 func initProxyPool() {
+	// 服务端模式不需要代理池
+	if appConfig.PoolServer.Enable && appConfig.PoolServer.Mode == "server" {
+		logger.Info("🖥️ 服务端模式，跳过代理初始化")
+		return
+	}
+
 	// 添加订阅链接（新配置）
 	for _, sub := range appConfig.ProxyPool.Subscribes {
 		proxy.Manager.AddSubscribeURL(sub)
@@ -2084,16 +2090,20 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				acc.LastUsed = time.Now().Add(cooldownTime)
 				acc.Mu.Unlock()
 				logger.Info("⏳ [%s] 429 限流，账号进入延长冷却 %v", acc.Data.Email, cooldownTime)
-				// 429不计入重试次数，等待后继续尝试其他账号
 				pool.Pool.MarkUsed(acc, false)
 				time.Sleep(1 * time.Second) // 短暂等待后切换账号
 				retry--                     // 不计入重试次数
 				continue
 			}
+			if resp.StatusCode == 400 {
+				logger.Warn("⚠️ [%s] 400 错误，换账号重试", acc.Data.Email)
+				pool.Pool.MarkUsed(acc, false)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
 			pool.Pool.MarkUsed(acc, false) // 标记失败
 			continue
 		}
-
 		// 成功，读取响应
 		respBody, _ = utils.ReadResponseBody(resp)
 		resp.Body.Close()
@@ -2878,10 +2888,11 @@ func setupAPIRoutes(r *gin.Engine) {
 
 	r.GET("/", func(c *gin.Context) {
 		stats := apiStats.GetStats()
-		c.JSON(200, gin.H{
+		response := gin.H{
 			"status":  "running",
 			"service": "business2api",
 			"version": "2.1.6",
+			"mode":    map[PoolMode]string{PoolModeLocal: "local", PoolModeServer: "server", PoolModeClient: "client"}[poolMode],
 			// 统计数据
 			"uptime":           stats["uptime"],
 			"total_requests":   stats["total_requests"],
@@ -2902,7 +2913,16 @@ func setupAPIRoutes(r *gin.Engine) {
 			},
 			// Flow 状态
 			"flow_enabled": flowHandler != nil,
-		})
+		}
+		// 服务端模式：添加客户端信息
+		if poolServer != nil {
+			response["clients"] = gin.H{
+				"count":         poolServer.GetClientCount(),
+				"total_threads": poolServer.GetTotalThreads(),
+				"list":          poolServer.GetClientsInfo(),
+			}
+		}
+		c.JSON(200, response)
 	})
 
 	r.GET("/health", func(c *gin.Context) {

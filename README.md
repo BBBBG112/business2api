@@ -63,7 +63,7 @@ docker run -d \
   --name business2api \
   -p 8000:8000 \
   -v $(pwd)/data:/app/data \
-  -v $(pwd)/config.json:/app/config.json:ro \
+  -v $(pwd)/config.json:/app/config/config.json:ro \
   ghcr.io/xxxteam/business2api:latest
 ```
 
@@ -136,13 +136,12 @@ sudo systemctl start business2api
   "data_dir": "./data",                // 账号数据目录
   "default_config": "",                // 默认 configId（可选）
   "debug": false,                      // 调试模式（输出详细日志）
-  "proxy": "",                         // 代理地址（可选）
   
   "pool": {
     "target_count": 50,                // 目标账号数量
     "min_count": 10,                   // 最小账号数，低于此值触发注册
     "check_interval_minutes": 30,      // 检查间隔（分钟）
-    "register_threads": 1,             // 注册线程数
+    "register_threads": 1,             // 本地注册线程数
     "register_headless": true,         // 无头模式注册
     "refresh_on_startup": true,        // 启动时刷新账号
     "refresh_cooldown_sec": 240,       // 刷新冷却时间（秒）
@@ -156,11 +155,20 @@ sudo systemctl start business2api
   "pool_server": {                     
     "enable": false,                   // 是否启用分离模式
     "mode": "local",                   // 运行模式：local/server/client
-    "server_addr": "http://ip:8001",   // 服务器地址（client模式）
-    "listen_addr": ":8001",            // 监听地址（server模式）
+    "server_addr": "http://ip:8000",   // 服务器地址（client模式）
+    "listen_addr": ":8000",            // 监听地址（server模式）
     "secret": "your-secret-key",       // 通信密钥
     "target_count": 50,                // 目标账号数（server模式）
-    "data_dir": "./data"               // 数据目录（server模式）
+    "client_threads": 2,               // 客户端并发线程数
+    "data_dir": "./data",              // 数据目录（server模式）
+    "expired_action": "delete"         // 过期账号处理：delete/refresh/queue
+  },
+
+  "proxy_pool": {
+    "subscribes": [],                  // 代理订阅链接列表
+    "files": [],                       // 本地代理文件列表
+    "health_check": true,              // 启用健康检查
+    "check_on_startup": true           // 启动时检查
   }
 }
 ```
@@ -199,13 +207,15 @@ sudo systemctl start business2api
 
 ```json
 {
+  "api_keys": ["sk-your-api-key"],
+  "listen_addr": ":8000",
   "pool_server": {
     "enable": true,
     "mode": "server",
-    "listen_addr": ":8001",
     "secret": "shared-secret-key",
     "target_count": 100,
-    "data_dir": "./data"
+    "data_dir": "./data",
+    "expired_action": "delete"
   }
 }
 ```
@@ -217,11 +227,29 @@ sudo systemctl start business2api
   "pool_server": {
     "enable": true,
     "mode": "client",
-    "server_addr": "http://server-ip:8001",
-    "secret": "shared-secret-key"
+    "server_addr": "http://server-ip:8000",
+    "secret": "shared-secret-key",
+    "client_threads": 3
+  },
+  "proxy_pool": {
+    "subscribes": ["https://your-proxy-subscribe-url"],
+    "health_check": true,
+    "check_on_startup": true
   }
 }
 ```
+
+### 配置项说明
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `client_threads` | 客户端并发任务数 | 1 |
+| `expired_action` | 过期账号处理方式 | delete |
+
+**expired_action 可选值：**
+- `delete` - 删除过期账号
+- `refresh` - 尝试浏览器刷新
+- `queue` - 保留在队列等待重试
 
 **架构说明（v2.x）：**
 ```
@@ -356,10 +384,10 @@ curl http://localhost:8000/v1/chat/completions \
 
 | 错误 | 原因 | 解决方案 |
 |------|------|----------|
-| `无法获取验证码邮件` | 临时邮箱服务不稳定或邮件延迟 | 多次重试，检查代理是否正常 |
+| `无法获取验证码邮件` | 临时邮箱服务不稳定或邮件延迟 | 代理遭到拉黑，更换代理 |
 | `panic: nil pointer` | 浏览器启动失败或页面未加载 | 检查 Chrome 是否安装，确保有足够内存 |
-| `页面显示错误: 电话` | Google 要求手机验证 | 更换代理 IP 或等待一段时间 |
 | `找不到提交按钮` | 页面结构变化或加载超时 | 升级到最新版本，检查网络 |
+
 
 ### API 相关
 
@@ -447,15 +475,18 @@ GOOS=darwin GOARCH=arm64 go build -o business2api-darwin-arm64 .
 ```
 .
 ├── main.go              # 主程序入口
-├── utils.go             # 工具函数
 ├── config/              # 配置文件
+│   ├── config.json.example
+│   └── README.md
 ├── src/
-│   ├── api/             # API 处理
 │   ├── flow/            # Flow 图片/视频生成
-│   ├── logger/          # 日志
-│   ├── pool/            # 账号池管理
-│   └── register/        # 浏览器注册
+│   ├── logger/          # 日志模块
+│   ├── pool/            # 账号池管理（C/S架构）
+│   ├── proxy/           # 代理池管理
+│   ├── register/        # 浏览器自动注册
+│   └── utils/           # 工具函数
 ├── docker/              # Docker 相关
+│   └── docker-compose.yml
 └── .github/             # GitHub Actions
 ```
 

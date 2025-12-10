@@ -39,8 +39,6 @@ type RegisterStats struct {
 	mu        sync.RWMutex
 }
 
-var registerStats = &RegisterStats{}
-
 func (s *RegisterStats) AddSuccess() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

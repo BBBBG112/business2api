@@ -22,13 +22,15 @@ import (
 
 // PoolServerConfig 号池服务器配置
 type PoolServerConfig struct {
-	Enable      bool   `json:"enable"`       // 是否启用分离模式
-	Mode        string `json:"mode"`         // 模式: "server" 或 "client"
-	ServerAddr  string `json:"server_addr"`  // 服务器地址（客户端模式使用）
-	ListenAddr  string `json:"listen_addr"`  // WebSocket监听地址（服务端模式使用）
-	Secret      string `json:"secret"`       // 通信密钥
-	TargetCount int    `json:"target_count"` // 目标账号数量
-	DataDir     string `json:"data_dir"`     // 数据目录
+	Enable        bool   `json:"enable"`         // 是否启用分离模式
+	Mode          string `json:"mode"`           // 模式: "server" 或 "client"
+	ServerAddr    string `json:"server_addr"`    // 服务器地址（客户端模式使用）
+	ListenAddr    string `json:"listen_addr"`    // WebSocket监听地址（服务端模式使用）
+	Secret        string `json:"secret"`         // 通信密钥
+	TargetCount   int    `json:"target_count"`   // 目标账号数量
+	DataDir       string `json:"data_dir"`       // 数据目录
+	ClientThreads int    `json:"client_threads"` // 客户端并发线程数
+	ExpiredAction string `json:"expired_action"` // 账号过期处理: "delete"=删除, "refresh"=浏览器刷新, "queue"=排队等待
 }
 
 // WSMessageType WebSocket消息类型
@@ -49,22 +51,31 @@ const (
 	WSMsgRequestTask    WSMessageType = "request_task"    // 请求任务
 )
 
+// 版本信息
+const (
+	ProtocolVersion = "1.0"
+	ServerVersion   = "2.0.0"
+)
+
 // WSMessage WebSocket消息
 type WSMessage struct {
 	Type      WSMessageType          `json:"type"`
+	Version   string                 `json:"version,omitempty"`
 	Timestamp int64                  `json:"timestamp"`
 	Data      map[string]interface{} `json:"data,omitempty"`
 }
 
 // WSClient WebSocket客户端连接
 type WSClient struct {
-	ID       string
-	Conn     *websocket.Conn
-	Server   *PoolServer
-	Send     chan []byte
-	IsAlive  bool
-	LastPing time.Time
-	mu       sync.Mutex
+	ID            string
+	Conn          *websocket.Conn
+	Server        *PoolServer
+	Send          chan []byte
+	IsAlive       bool
+	LastPing      time.Time
+	MaxThreads    int    // 客户端最大线程数
+	ClientVersion string // 客户端版本
+	mu            sync.Mutex
 }
 
 // PoolServer 号池服务器（管理端）
@@ -78,6 +89,9 @@ type PoolServer struct {
 	// 任务队列
 	registerQueue chan int      // 注册任务队列
 	refreshQueue  chan *Account // 续期任务队列
+
+	// 轮询分配
+	nextClientIdx int // 下一个分配任务的客户端索引
 }
 
 // NewPoolServer 创建号池服务器
@@ -275,16 +289,21 @@ func (c *WSClient) handleMessage(msg WSMessage) {
 
 	switch msg.Type {
 	case WSMsgHeartbeatAck:
-		// 心跳响应，更新连接状态
 		logger.Debug("[WS] 收到心跳响应: %s", c.ID)
 
 	case WSMsgClientReady:
-		// 客户端就绪，立即分配任务
-		logger.Info("[WS] 客户端 %s 就绪，检查任务...", c.ID)
+		if threads, ok := msg.Data["max_threads"].(float64); ok && threads > 0 {
+			c.MaxThreads = int(threads)
+		} else {
+			c.MaxThreads = 1
+		}
+		if ver, ok := msg.Data["client_version"].(string); ok {
+			c.ClientVersion = ver
+		}
+		logger.Info("[WS] 客户端 %s 就绪 (v%s, 线程:%d)", c.ID, c.ClientVersion, c.MaxThreads)
 		c.Server.assignTask(c)
 
 	case WSMsgRequestTask:
-		// 客户端请求任务
 		logger.Debug("[WS] 客户端 %s 请求任务", c.ID)
 		c.Server.assignTask(c)
 
@@ -298,7 +317,6 @@ func (c *WSClient) handleMessage(msg WSMessage) {
 	}
 }
 
-// removeClient 移除客户端
 func (ps *PoolServer) removeClient(clientID string) {
 	ps.clientsMu.Lock()
 	defer ps.clientsMu.Unlock()
@@ -308,20 +326,18 @@ func (ps *PoolServer) removeClient(clientID string) {
 		logger.Info("[WS] 客户端断开: %s (剩余: %d)", clientID, len(ps.clients))
 	}
 }
-
-// taskDispatcher 任务分发器
 func (ps *PoolServer) taskDispatcher() {
 	for {
 		select {
 		case count := <-ps.registerQueue:
-			// 分发注册任务
-			ps.broadcastTask(WSMsgTaskRegister, map[string]interface{}{
+			// 分发注册任务（轮询分配）
+			ps.assignTaskRoundRobin(WSMsgTaskRegister, map[string]interface{}{
 				"count": count,
 			})
 
 		case acc := <-ps.refreshQueue:
-			// 分发续期任务
-			ps.broadcastTask(WSMsgTaskRefresh, map[string]interface{}{
+			// 分发续期任务（轮询分配）
+			ps.assignTaskRoundRobin(WSMsgTaskRefresh, map[string]interface{}{
 				"email":         acc.Data.Email,
 				"cookies":       acc.Data.Cookies,
 				"authorization": acc.Data.Authorization,
@@ -332,8 +348,8 @@ func (ps *PoolServer) taskDispatcher() {
 	}
 }
 
-// broadcastTask 广播任务给所有客户端
-func (ps *PoolServer) broadcastTask(msgType WSMessageType, data map[string]interface{}) {
+// assignTaskRoundRobin 轮询分配任务给单个客户端
+func (ps *PoolServer) assignTaskRoundRobin(msgType WSMessageType, data map[string]interface{}) bool {
 	msg := WSMessage{
 		Type:      msgType,
 		Timestamp: time.Now().Unix(),
@@ -341,61 +357,121 @@ func (ps *PoolServer) broadcastTask(msgType WSMessageType, data map[string]inter
 	}
 	msgBytes, _ := json.Marshal(msg)
 
-	ps.clientsMu.RLock()
-	defer ps.clientsMu.RUnlock()
+	ps.clientsMu.Lock()
+	defer ps.clientsMu.Unlock()
 
+	if len(ps.clients) == 0 {
+		return false
+	}
+
+	// 获取客户端列表
+	clientList := make([]*WSClient, 0, len(ps.clients))
 	for _, client := range ps.clients {
-		select {
-		case client.Send <- msgBytes:
-		default:
-			// 发送队列满，跳过
+		if client.IsAlive {
+			clientList = append(clientList, client)
 		}
 	}
-}
 
-// assignTask 分配任务给特定客户端
+	if len(clientList) == 0 {
+		return false
+	}
+
+	// 轮询分配
+	ps.nextClientIdx = ps.nextClientIdx % len(clientList)
+	client := clientList[ps.nextClientIdx]
+	ps.nextClientIdx++
+
+	select {
+	case client.Send <- msgBytes:
+		logger.Info("[分配] 任务 %s 分配给 %s", msgType, client.ID)
+		return true
+	default:
+		// 发送队列满，尝试下一个
+		for i := 0; i < len(clientList)-1; i++ {
+			ps.nextClientIdx = ps.nextClientIdx % len(clientList)
+			client = clientList[ps.nextClientIdx]
+			ps.nextClientIdx++
+			select {
+			case client.Send <- msgBytes:
+				logger.Info("[分配] 任务 %s 分配给 %s", msgType, client.ID)
+				return true
+			default:
+				continue
+			}
+		}
+	}
+	return false
+}
 func (ps *PoolServer) assignTask(client *WSClient) {
-	// 优先检查是否有需要续期的账号（未刷新且失败次数较高的）
+	maxThreads := client.MaxThreads
+	if maxThreads <= 0 {
+		maxThreads = 1
+	}
+	assignedCount := 0
 	ps.pool.mu.RLock()
+	var refreshAccounts []*Account
 	for _, acc := range ps.pool.pendingAccounts {
 		if !acc.Refreshed && acc.FailCount > 0 {
-			ps.pool.mu.RUnlock()
-			logger.Info("[WS] 分配续期任务给 %s: %s", client.ID, acc.Data.Email)
-			msg := WSMessage{
-				Type:      WSMsgTaskRefresh,
-				Timestamp: time.Now().Unix(),
-				Data: map[string]interface{}{
-					"email":         acc.Data.Email,
-					"cookies":       acc.Data.Cookies,
-					"authorization": acc.Data.Authorization,
-					"config_id":     acc.ConfigID,
-					"csesidx":       acc.CSESIDX,
-				},
+			refreshAccounts = append(refreshAccounts, acc)
+			if len(refreshAccounts) >= maxThreads {
+				break
 			}
-			msgBytes, _ := json.Marshal(msg)
-			client.Send <- msgBytes
-			return
 		}
 	}
 	ps.pool.mu.RUnlock()
-
-	// 检查是否需要注册新账号
-	currentCount := ps.pool.TotalCount()
-	targetCount := ps.config.TargetCount
-	logger.Debug("[WS] 检查注册需求: 当前=%d, 目标=%d", currentCount, targetCount)
-
-	if currentCount < targetCount {
-		logger.Info("[WS] 分配注册任务给 %s (当前: %d, 目标: %d)", client.ID, currentCount, targetCount)
+	for _, acc := range refreshAccounts {
+		logger.Info("[WS] 分配续期任务给 %s: %s", client.ID, acc.Data.Email)
 		msg := WSMessage{
-			Type:      WSMsgTaskRegister,
+			Type:      WSMsgTaskRefresh,
 			Timestamp: time.Now().Unix(),
 			Data: map[string]interface{}{
-				"count": 1,
+				"email":         acc.Data.Email,
+				"cookies":       acc.Data.Cookies,
+				"authorization": acc.Data.Authorization,
+				"config_id":     acc.ConfigID,
+				"csesidx":       acc.CSESIDX,
 			},
 		}
 		msgBytes, _ := json.Marshal(msg)
-		client.Send <- msgBytes
-	} else {
+		select {
+		case client.Send <- msgBytes:
+			assignedCount++
+		default:
+		}
+	}
+	remainingSlots := maxThreads - assignedCount
+	if remainingSlots > 0 {
+		currentCount := ps.pool.TotalCount()
+		targetCount := ps.config.TargetCount
+		needCount := targetCount - currentCount
+
+		if needCount > 0 {
+			registerCount := remainingSlots
+			if registerCount > needCount {
+				registerCount = needCount
+			}
+
+			logger.Info("[WS] 分配注册任务给 %s: %d个 (当前: %d, 目标: %d, 线程: %d)",
+				client.ID, registerCount, currentCount, targetCount, maxThreads)
+			for i := 0; i < registerCount; i++ {
+				msg := WSMessage{
+					Type:      WSMsgTaskRegister,
+					Timestamp: time.Now().Unix(),
+					Data: map[string]interface{}{
+						"count": 1,
+					},
+				}
+				msgBytes, _ := json.Marshal(msg)
+				select {
+				case client.Send <- msgBytes:
+					assignedCount++
+				default:
+				}
+			}
+		}
+	}
+
+	if assignedCount == 0 {
 		logger.Debug("[WS] 无任务需要分配给 %s", client.ID)
 	}
 }
@@ -409,7 +485,6 @@ func (ps *PoolServer) heartbeatChecker() {
 		ps.clientsMu.RLock()
 		for id, client := range ps.clients {
 			client.mu.Lock()
-			// 延长心跳超时检测到3分钟，以适应长时间任务
 			if time.Since(client.LastPing) > 180*time.Second {
 				client.IsAlive = false
 				logger.Warn("[WS] 客户端 %s 心跳超时 (last: %v ago)", id, time.Since(client.LastPing))
@@ -420,7 +495,6 @@ func (ps *PoolServer) heartbeatChecker() {
 	}
 }
 
-// handleRegisterResult 处理注册结果
 func (ps *PoolServer) handleRegisterResult(data map[string]interface{}) {
 	success, _ := data["success"].(bool)
 	email, _ := data["email"].(string)
@@ -434,8 +508,6 @@ func (ps *PoolServer) handleRegisterResult(data map[string]interface{}) {
 		logger.Warn("❌ 注册失败: %s", errMsg)
 	}
 }
-
-// handleRefreshResult 处理续期结果
 func (ps *PoolServer) handleRefreshResult(data map[string]interface{}) {
 	email, _ := data["email"].(string)
 	success, _ := data["success"].(bool)
@@ -449,6 +521,51 @@ func (ps *PoolServer) handleRefreshResult(data map[string]interface{}) {
 	} else {
 		errMsg, _ := data["error"].(string)
 		logger.Warn("❌ 账号续期失败 %s: %s", email, errMsg)
+		action := ps.config.ExpiredAction
+		if action == "" {
+			action = "delete" // 默认删除
+		}
+
+		switch action {
+		case "delete":
+			ps.deleteAccount(email)
+		case "queue":
+			// 保持在队列中，不做处理
+		case "refresh":
+		default:
+			ps.deleteAccount(email)
+		}
+	}
+}
+
+// deleteAccount 删除账号
+func (ps *PoolServer) deleteAccount(email string) {
+	ps.pool.mu.Lock()
+	defer ps.pool.mu.Unlock()
+
+	// 从 pending 队列删除
+	for i, acc := range ps.pool.pendingAccounts {
+		if acc.Data.Email == email {
+			// 删除文件
+			if acc.FilePath != "" {
+				os.Remove(acc.FilePath)
+			}
+			ps.pool.pendingAccounts = append(ps.pool.pendingAccounts[:i], ps.pool.pendingAccounts[i+1:]...)
+			logger.Info("🗑️ 已删除续期失败账号: %s", email)
+			return
+		}
+	}
+
+	// 从 ready 队列删除
+	for i, acc := range ps.pool.readyAccounts {
+		if acc.Data.Email == email {
+			if acc.FilePath != "" {
+				os.Remove(acc.FilePath)
+			}
+			ps.pool.readyAccounts = append(ps.pool.readyAccounts[:i], ps.pool.readyAccounts[i+1:]...)
+			logger.Info("🗑️ 已删除续期失败账号: %s", email)
+			return
+		}
 	}
 }
 
@@ -850,10 +967,6 @@ func (rc *RemotePoolClient) RefreshJWT(email string) (*CachedAccount, error) {
 
 	return acc, nil
 }
-
-// ==================== 账号上传（客户端回传） ====================
-
-// AccountUploadRequest 账号上传请求
 type AccountUploadRequest struct {
 	Email         string   `json:"email"`
 	FullName      string   `json:"full_name"`
@@ -862,7 +975,7 @@ type AccountUploadRequest struct {
 	Authorization string   `json:"authorization"`
 	ConfigID      string   `json:"config_id"`
 	CSESIDX       string   `json:"csesidx"`
-	IsNew         bool     `json:"is_new"` // 是否为新注册账号
+	IsNew         bool     `json:"is_new"` 
 }
 
 // handleUploadAccount 处理账号上传（客户端回传鉴权文件）
@@ -947,31 +1060,40 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 	} else {
 		logger.Info("✅ 收到账号续期数据: %s", req.Email)
 	}
-
-	// 重新加载账号池
 	ps.pool.Load(dataDir)
 
-	// 如果是续期数据，标记账号为已刷新，防止继续刷新
 	if !req.IsNew {
 		ps.pool.mu.Lock()
 		for _, acc := range ps.pool.pendingAccounts {
 			if acc.Data.Email == req.Email {
+				acc.Data.Cookies = req.Cookies
+				acc.Data.CookieString = req.CookieString
+				acc.Data.Authorization = req.Authorization
+				acc.Data.ConfigID = req.ConfigID
+				acc.Data.CSESIDX = req.CSESIDX
+				acc.ConfigID = req.ConfigID
+				acc.CSESIDX = req.CSESIDX
 				acc.Refreshed = true
 				acc.FailCount = 0
 				acc.BrowserRefreshCount = 0
 				acc.LastRefresh = time.Now()
-				acc.JWTExpires = time.Time{} // 重置JWT过期时间，让它重新获取
-				// 移到就绪队列
+				acc.JWTExpires = time.Time{}
 				ps.pool.mu.Unlock()
 				ps.pool.MarkReady(acc)
 				logger.Info("✅ [%s] 续期数据已应用，移至就绪队列", req.Email)
 				goto respond
 			}
 		}
-		// 也检查就绪队列中的账号（可能已经在就绪队列中）
 		for _, acc := range ps.pool.readyAccounts {
 			if acc.Data.Email == req.Email {
 				acc.Mu.Lock()
+				acc.Data.Cookies = req.Cookies
+				acc.Data.CookieString = req.CookieString
+				acc.Data.Authorization = req.Authorization
+				acc.Data.ConfigID = req.ConfigID
+				acc.Data.CSESIDX = req.CSESIDX
+				acc.ConfigID = req.ConfigID
+				acc.CSESIDX = req.CSESIDX
 				acc.Refreshed = true
 				acc.FailCount = 0
 				acc.BrowserRefreshCount = 0
@@ -1015,4 +1137,44 @@ func (rc *RemotePoolClient) UploadAccount(acc *AccountUploadRequest) error {
 		return fmt.Errorf("上传失败: %s", errMsg)
 	}
 	return nil
+}
+
+type ClientInfo struct {
+	ID       string `json:"id"`
+	Version  string `json:"version"`
+	Threads  int    `json:"threads"`
+	IsAlive  bool   `json:"is_alive"`
+	LastPing int64  `json:"last_ping"`
+}
+
+func (ps *PoolServer) GetClientsInfo() []ClientInfo {
+	ps.clientsMu.RLock()
+	defer ps.clientsMu.RUnlock()
+
+	clients := make([]ClientInfo, 0, len(ps.clients))
+	for id, c := range ps.clients {
+		clients = append(clients, ClientInfo{
+			ID:       id,
+			Version:  c.ClientVersion,
+			Threads:  c.MaxThreads,
+			IsAlive:  c.IsAlive,
+			LastPing: c.LastPing.Unix(),
+		})
+	}
+	return clients
+}
+func (ps *PoolServer) GetClientCount() int {
+	ps.clientsMu.RLock()
+	defer ps.clientsMu.RUnlock()
+	return len(ps.clients)
+}
+
+func (ps *PoolServer) GetTotalThreads() int {
+	ps.clientsMu.RLock()
+	defer ps.clientsMu.RUnlock()
+	total := 0
+	for _, c := range ps.clients {
+		total += c.MaxThreads
+	}
+	return total
 }

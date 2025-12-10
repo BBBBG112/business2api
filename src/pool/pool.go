@@ -410,9 +410,7 @@ func (p *AccountPool) refreshWorker(id int) {
 				acc.Mu.Lock()
 				browserRefreshCount := acc.BrowserRefreshCount
 				acc.Mu.Unlock()
-
-				// 尝试浏览器刷新（有次数限制）
-				if EnableBrowserRefresh && BrowserRefreshMaxRetry > 0 && browserRefreshCount < BrowserRefreshMaxRetry {
+				if EnableBrowserRefresh && BrowserRefreshMaxRetry > 0 && browserRefreshCount < BrowserRefreshMaxRetry && RefreshCookieWithBrowser != nil {
 					acc.Mu.Lock()
 					acc.BrowserRefreshCount++
 					acc.Mu.Unlock()

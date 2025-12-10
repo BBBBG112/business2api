@@ -29,6 +29,9 @@ type BrowserRegisterResult struct {
 // RunBrowserRegisterFunc 注册函数类型
 type RunBrowserRegisterFunc func(headless bool, proxy string, id int) *BrowserRegisterResult
 
+// 客户端版本
+const ClientVersion = "2.0.0"
+
 var (
 	RunBrowserRegister RunBrowserRegisterFunc
 	ClientHeadless     bool
@@ -39,7 +42,7 @@ var (
 	IsProxyReady       func() bool                      // 检查代理是否就绪
 	WaitProxyReady     func(timeout time.Duration) bool // 等待代理就绪
 	GetHealthyCount    func() int                       // 获取健康代理数量
-	proxyReadyTimeout  = 60 * time.Second               // 代理就绪超时时间
+	proxyReadyTimeout  = 30 * time.Second               // 代理就绪超时时间（减少等待）
 )
 
 // PoolClient 号池客户端
@@ -53,15 +56,21 @@ type PoolClient struct {
 	mu        sync.Mutex
 	writeMu   sync.Mutex // WebSocket写入锁
 	isRunning bool
+	taskSem   chan struct{} // 任务并发信号量
 }
 
 // NewPoolClient 创建号池客户端
 func NewPoolClient(config PoolServerConfig) *PoolClient {
+	threads := config.ClientThreads
+	if threads <= 0 {
+		threads = 1
+	}
 	return &PoolClient{
 		config:    config,
 		send:      make(chan []byte, 256),
 		done:      make(chan struct{}),
 		reconnect: make(chan struct{}, 1),
+		taskSem:   make(chan struct{}, threads),
 	}
 }
 
@@ -120,29 +129,31 @@ func (pc *PoolClient) connect() error {
 	}
 
 	pc.conn = conn
-
-	// 发送就绪消息
+	threads := pc.config.ClientThreads
+	if threads <= 0 {
+		threads = 1
+	}
 	pc.sendMessage(WSMessage{
 		Type:      WSMsgClientReady,
+		Version:   ClientVersion,
 		Timestamp: time.Now().Unix(),
+		Data: map[string]interface{}{
+			"max_threads":      threads,
+			"client_version":   ClientVersion,
+			"protocol_version": ProtocolVersion,
+		},
 	})
 
 	return nil
 }
 func (pc *PoolClient) work() {
-	// 创建新的stopPump channel
 	pc.stopPump = make(chan struct{})
-
-	// 启动三个独立线程
 	go pc.writePump()     // 消息发送
 	go pc.heartbeatPump() // 独立心跳保活
 	pc.readPump()         // 消息读取（阻塞）
-
-	// readPump退出后，关闭stopPump通知其他线程退出
 	close(pc.stopPump)
 }
 
-// heartbeatPump 独立心跳保活线程，只要连接存在就周期发心跳
 func (pc *PoolClient) heartbeatPump() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -256,57 +267,62 @@ func (pc *PoolClient) handleMessage(msg WSMessage) {
 	}
 }
 
-// handleRegisterTask 处理注册任务
+// handleRegisterTask 处理注册任务（每次只处理1个）
 func (pc *PoolClient) handleRegisterTask(data map[string]interface{}) {
-	count := 1
-	if c, ok := data["count"].(float64); ok {
-		count = int(c)
-	}
+	// 获取信号量（控制并发数）
+	pc.taskSem <- struct{}{}
+	defer func() { <-pc.taskSem }()
 
-	logger.Info("收到注册任务: %d 个账号", count)
+	// 生成任务ID用于日志
+	taskID := time.Now().UnixNano() % 1000
+
+	logger.Info("收到注册任务 [%d]", taskID)
 	if GetHealthyCount != nil && GetHealthyCount() >= 1 {
+		// 已有健康代理，直接开始
 	} else if WaitProxyReady != nil {
 		if !WaitProxyReady(proxyReadyTimeout) {
 			logger.Warn("代理未就绪，使用静态代理: %s", ClientProxy)
 		}
 	}
 
-	for i := 0; i < count; i++ {
-		// 获取代理（优先使用代理池）
-		currentProxy := ClientProxy
-		if GetClientProxy != nil {
-			currentProxy = GetClientProxy()
-		}
-		logger.Info("[注册 %d] 使用代理: %s", i, currentProxy)
-		result := RunBrowserRegister(ClientHeadless, currentProxy, i)
+	// 获取代理（优先使用代理池）
+	currentProxy := ClientProxy
+	if GetClientProxy != nil {
+		currentProxy = GetClientProxy()
+	}
+	logger.Info("[注册 %d] 使用代理: %s", taskID, currentProxy)
+	result := RunBrowserRegister(ClientHeadless, currentProxy, int(taskID))
 
-		// 任务完成后释放代理
-		if ReleaseProxy != nil && currentProxy != "" && currentProxy != ClientProxy {
-			ReleaseProxy(currentProxy)
-		}
+	// 任务完成后释放代理
+	if ReleaseProxy != nil && currentProxy != "" && currentProxy != ClientProxy {
+		ReleaseProxy(currentProxy)
+	}
 
-		if result.Success {
-			// 上传账号到服务器
-			if err := pc.uploadAccount(result, true); err != nil {
-				logger.Error("上传注册结果失败: %v", err)
-				pc.sendRegisterResult(false, "", err.Error())
-			} else {
-				logger.Info("✅ 注册成功: %s", result.Email)
-				pc.sendRegisterResult(true, result.Email, "")
-			}
+	if result.Success {
+		// 上传账号到服务器
+		if err := pc.uploadAccount(result, true); err != nil {
+			logger.Error("上传注册结果失败: %v", err)
+			pc.sendRegisterResult(false, "", err.Error())
 		} else {
-			errMsg := "未知错误"
-			if result.Error != nil {
-				errMsg = result.Error.Error()
-			}
-			logger.Warn("❌ 注册失败: %s", errMsg)
-			pc.sendRegisterResult(false, "", errMsg)
+			logger.Info("✅ 注册成功: %s", result.Email)
+			pc.sendRegisterResult(true, result.Email, "")
 		}
+	} else {
+		errMsg := "未知错误"
+		if result.Error != nil {
+			errMsg = result.Error.Error()
+		}
+		logger.Warn("❌ 注册失败: %s", errMsg)
+		pc.sendRegisterResult(false, "", errMsg)
 	}
 }
 
 // handleRefreshTask 处理续期任务
 func (pc *PoolClient) handleRefreshTask(data map[string]interface{}) {
+	// 获取信号量
+	pc.taskSem <- struct{}{}
+	defer func() { <-pc.taskSem }()
+
 	email, _ := data["email"].(string)
 	if email == "" {
 		logger.Warn("续期任务缺少email")
@@ -447,7 +463,7 @@ func (pc *PoolClient) uploadAccount(result *BrowserRegisterResult, isNew bool) e
 	return pc.uploadAccountData(req)
 }
 
-// uploadAccountData 上传账号数据到服务器
+// uploadAccountData 上传账号数据到服务器（带重试）
 func (pc *PoolClient) uploadAccountData(req *AccountUploadRequest) error {
 	u, err := url.Parse(pc.config.ServerAddr)
 	if err != nil {
@@ -461,35 +477,52 @@ func (pc *PoolClient) uploadAccountData(req *AccountUploadRequest) error {
 		return err
 	}
 
-	httpReq, err := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
-	if err != nil {
-		return err
+	maxRetries := 3
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			logger.Info("[%s] 上传重试 %d/%d...", req.Email, i+1, maxRetries)
+			time.Sleep(time.Duration(i*2) * time.Second)
+		}
+
+		httpReq, err := http.NewRequest("POST", uploadURL, bytes.NewReader(data))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		if pc.config.Secret != "" {
+			httpReq.Header.Set("X-Pool-Secret", pc.config.Secret)
+		}
+
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
+
+		if success, ok := result["success"].(bool); !ok || !success {
+			errMsg, _ := result["error"].(string)
+			lastErr = fmt.Errorf("上传失败: %s", errMsg)
+			continue
+		}
+
+		logger.Debug("账号数据已上传: %s", req.Email)
+		return nil
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	if pc.config.Secret != "" {
-		httpReq.Header.Set("X-Pool-Secret", pc.config.Secret)
-	}
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
-	}
-
-	if success, ok := result["success"].(bool); !ok || !success {
-		errMsg, _ := result["error"].(string)
-		return fmt.Errorf("上传失败: %s", errMsg)
-	}
-
-	logger.Debug("账号数据已上传: %s", req.Email)
-	return nil
+	return fmt.Errorf("上传失败（重试%d次）: %v", maxRetries, lastErr)
 }
 
 // sendRegisterResult 发送注册结果

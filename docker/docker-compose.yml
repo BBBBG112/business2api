@@ -9,7 +9,7 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/app/config/config.json:ro
     environment:
       - TZ=Asia/Shanghai
       - LISTEN_ADDR=:8000

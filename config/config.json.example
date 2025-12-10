@@ -9,27 +9,29 @@
     "min_count": 10,
     "check_interval_minutes": 30,
     "register_threads": 1,
-    "register_headless": false,
+    "register_headless": true,
     "refresh_on_startup": true,
     "refresh_cooldown_sec": 240,
     "use_cooldown_sec": 15,
     "max_fail_count": 3,
     "enable_browser_refresh": true,
-    "browser_refresh_headless": false,
+    "browser_refresh_headless": true,
     "browser_refresh_max_retry": 1
   },
   "pool_server": {
     "enable": false,
     "mode": "local",
-    "server_addr": "",
-    "secret": "",
+    "server_addr": "http://server-ip:8000",
+    "listen_addr": ":8000",
+    "secret": "your-secret-key",
     "target_count": 50,
-    "data_dir": "./data"
+    "client_threads": 2,
+    "data_dir": "./data",
+    "expired_action": "delete"
   },
   "proxy_pool": {
-    "proxy": "",
     "subscribes": [
-      "https://example.com/subscribe/base64"
+      "http://example.com/s/example"
     ],
     "files": [],
     "health_check": true,
@@ -38,11 +40,8 @@
   "flow": {
     "enable": false,
     "tokens": [],
-    "proxy": "",
     "timeout": 120,
     "poll_interval": 3,
     "max_poll_attempts": 500
-  },
-  
-  "proxy": ""
+  }
 }

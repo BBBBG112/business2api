@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,7 @@ type ProxyNode struct {
 	Healthy   bool
 	LastCheck time.Time
 	LocalPort int
+	Latency   time.Duration
 
 	// Reality 相关
 	Flow        string // xtls-rprx-vision
@@ -57,9 +59,7 @@ type ProxyNode struct {
 	PublicKey   string // reality pbk
 	ShortId     string // reality sid
 	SpiderX     string // reality spx
-
-	// ALPN
-	ALPN string // h2, http/1.1
+	ALPN        string
 }
 
 // InstanceStatus 实例状态
@@ -81,7 +81,7 @@ type XrayInstance struct {
 	cancel    context.CancelFunc
 	status    InstanceStatus
 	lastUsed  time.Time
-	proxyURL  string // 缓存的代理URL
+	proxyURL  string
 	mu        sync.Mutex
 }
 
@@ -1114,7 +1114,8 @@ func (pm *ProxyManager) generateStreamSettings(node *ProxyNode) string {
 		if host == "" {
 			host = node.Server
 		}
-		settings = fmt.Sprintf(`"wsSettings": {"path": "%s", "headers": {"Host": "%s"}}`, node.Path, host)
+		// 使用新格式：独立的 host 字段，避免 deprecated 警告
+		settings = fmt.Sprintf(`"wsSettings": {"path": "%s", "host": "%s"}`, node.Path, host)
 
 	case "grpc":
 		settings = fmt.Sprintf(`"grpcSettings": {"serviceName": "%s", "multiMode": true}`, node.Path)
@@ -1264,8 +1265,6 @@ func (pm *ProxyManager) StopAll() {
 	}
 	log.Printf("🛑 所有 xray 实例已停止")
 }
-
-// CheckHealth 检查节点健康状态
 func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 	proxyURL, err := pm.StartXray(node)
 	if err != nil {
@@ -1300,7 +1299,6 @@ func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 }
 
 func (pm *ProxyManager) CheckAllHealth() {
-	// 防止重复执行
 	pm.mu.Lock()
 	if pm.healthChecking {
 		pm.mu.Unlock()
@@ -1372,6 +1370,11 @@ func (pm *ProxyManager) CheckAllHealth() {
 
 	wg.Wait()
 
+	// 按延迟排序（延迟低的排前面）
+	sort.Slice(healthy, func(i, j int) bool {
+		return healthy[i].Latency < healthy[j].Latency
+	})
+
 	pm.mu.Lock()
 	pm.healthyNodes = healthy
 	pm.healthChecking = false
@@ -1379,7 +1382,19 @@ func (pm *ProxyManager) CheckAllHealth() {
 	pm.readyCond.Broadcast()
 	pm.mu.Unlock()
 
-	log.Printf("✅ 健康检查完成: %d/%d 节点可用", len(healthy), len(nodes))
+	// 输出前5个最快节点
+	if len(healthy) > 0 {
+		topN := 5
+		if len(healthy) < topN {
+			topN = len(healthy)
+		}
+		log.Printf("✅ 健康检查完成: %d/%d 节点可用, 最快前%d: %v~%v",
+			len(healthy), len(nodes), topN,
+			healthy[0].Latency.Round(time.Millisecond),
+			healthy[topN-1].Latency.Round(time.Millisecond))
+	} else {
+		log.Printf("✅ 健康检查完成: %d/%d 节点可用", len(healthy), len(nodes))
+	}
 }
 
 // GetFromPool 从实例池获取一个空闲实例
