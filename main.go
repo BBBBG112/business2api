@@ -493,6 +493,9 @@ func initProxyPool() {
 		return
 	}
 
+	// 初始化 sing-box（用于 hysteria2/tuic 等协议）
+	proxy.InitSingbox()
+
 	// 添加订阅链接（新配置）
 	for _, sub := range appConfig.ProxyPool.Subscribes {
 		proxy.Manager.AddSubscribeURL(sub)
@@ -2404,13 +2407,25 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			}
 
 			// 按顺序输出
+			successCount := 0
+			var lastErr error
 			for i, r := range downloaded {
 				if r.Err != nil {
 					logger.Error("❌ 下载文件[%d]失败: %v", i, r.Err)
+					lastErr = r.Err
 					continue
 				}
 				imgMarkdown := formatImageAsMarkdown(r.MimeType, r.Data)
 				chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": imgMarkdown}, nil)
+				fmt.Fprintf(writer, "data: %s\n\n", chunk)
+				flusher.Flush()
+				successCount++
+			}
+
+			// 如果所有文件都下载失败，发送错误提示
+			if successCount == 0 && lastErr != nil {
+				errMsg := fmt.Sprintf("生成的文件下载失败: %v", lastErr)
+				chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": errMsg}, nil)
 				fmt.Fprintf(writer, "data: %s\n\n", chunk)
 				flusher.Flush()
 			}
@@ -2426,15 +2441,22 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		fmt.Fprintf(writer, "data: [DONE]\n\n")
 		flusher.Flush()
 
-		// 更新统计
+		// 更新统计（区分图片和视频）
 		statsSuccess = true
-		statsImages = int64(len(pendingFiles))
+		for _, pf := range pendingFiles {
+			if strings.HasPrefix(pf.MimeType, "video/") {
+				statsVideos++
+			} else {
+				statsImages++
+			}
+		}
 	} else {
 		// 非流式响应
 		var fullContent strings.Builder
 		var fullReasoning strings.Builder
 		replyCount := 0
-		hasFile := false
+		var fileCount int64
+		var videoCount int64
 
 		for _, data := range dataList {
 			streamResp, ok := data["streamAssistResponse"].(map[string]interface{})
@@ -2458,8 +2480,12 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				replyCount++
 				if gc, ok := replyMap["groundedContent"].(map[string]interface{}); ok {
 					if content, ok := gc["content"].(map[string]interface{}); ok {
-						if _, ok := content["file"]; ok {
-							hasFile = true
+						if file, ok := content["file"].(map[string]interface{}); ok {
+							if mimeType, _ := file["mimeType"].(string); strings.HasPrefix(mimeType, "video/") {
+								videoCount++
+							} else {
+								fileCount++
+							}
 						}
 					}
 				}
@@ -2478,8 +2504,8 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		}
 		toolCalls := extractToolCalls(dataList)
 		// 调试日志
-		logger.Debug("📊 非流式响应统计: %d 个 reply, 包含文件=%v, content长度=%d, reasoning长度=%d, 工具调用=%d",
-			replyCount, hasFile, fullContent.Len(), fullReasoning.Len(), len(toolCalls))
+		logger.Debug("📊 非流式响应统计: %d 个 reply, 图片=%d, 视频=%d, content长度=%d, reasoning长度=%d, 工具调用=%d",
+			replyCount, fileCount, videoCount, fullContent.Len(), fullReasoning.Len(), len(toolCalls))
 
 		// 构建响应消息
 		message := gin.H{
@@ -2526,9 +2552,8 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		// 更新统计
 		statsSuccess = true
 		statsOutputTokens = int64(fullContent.Len() / 4) // 粗略估算输出 tokens
-		if hasFile {
-			statsImages = 1
-		}
+		statsImages = fileCount
+		statsVideos = videoCount
 	}
 }
 func apiKeyAuth() gin.HandlerFunc {
@@ -2802,8 +2827,11 @@ func runAsClient() {
 	pool.ClientHeadless = appConfig.Pool.RegisterHeadless
 	pool.ClientProxy = Proxy
 	pool.GetClientProxy = func() string {
-		if proxy.Manager.Count() > 0 {
-			return proxy.Manager.Next()
+		if proxy.Manager.HealthyCount() > 0 {
+			proxyURL := proxy.Manager.Next()
+			if proxyURL != "" {
+				return proxyURL
+			}
 		}
 		return Proxy
 	}

@@ -1116,7 +1116,53 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		return result
 	}
 	page.WaitLoad()
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
+
+	// 检查是否被代理403阻止
+	statusCheck, _ := page.Eval(`() => {
+		const pageText = document.body ? document.body.innerText : '';
+		const title = document.title || '';
+		const html = document.documentElement ? document.documentElement.outerHTML : '';
+		
+		// 检查403/被阻止的特征
+		const is403 = title.includes('403') || pageText.includes('403 Forbidden') || 
+			pageText.includes('Access Denied') || pageText.includes('访问被拒绝') ||
+			html.length < 500; // 页面内容过少可能是403
+			
+		// 检查是否还在加载
+		const hasLoader = document.querySelector('[class*="loading"]') || 
+			document.querySelector('[class*="spinner"]');
+		
+		return {
+			is403: is403,
+			isLoading: !!hasLoader,
+			htmlLen: html.length,
+			title: title,
+			url: window.location.href
+		};
+	}`)
+
+	if statusCheck != nil {
+		is403 := statusCheck.Value.Get("is403").Bool()
+		isLoading := statusCheck.Value.Get("isLoading").Bool()
+		htmlLen := statusCheck.Value.Get("htmlLen").Int()
+		pageURL := statusCheck.Value.Get("url").String()
+
+		log.Printf("[注册 %d] 页面状态: is403=%v, loading=%v, htmlLen=%d, url=%s",
+			threadID, is403, isLoading, htmlLen, pageURL)
+
+		if is403 {
+			result.Error = fmt.Errorf("代理被403阻止，请更换代理")
+			return result
+		}
+
+		// 如果还在加载，多等待一会儿
+		if isLoading || htmlLen < 1000 {
+			time.Sleep(3 * time.Second)
+			page.WaitLoad()
+		}
+	}
+
 	debugScreenshot(page, threadID, "01_page_loaded")
 	welcomeResult, _ := page.Eval(`() => {
 		const text = document.body ? document.body.textContent : '';
@@ -1178,13 +1224,56 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}
 
 	if emailInput == nil {
-		html, _ := page.HTML()
-		if len(html) > 2000 {
-			html = html[:2000]
+		// 先检查页面状态
+		pageState, _ := page.Eval(`() => {
+			const pageText = document.body ? document.body.innerText : '';
+			const htmlLen = document.documentElement ? document.documentElement.outerHTML.length : 0;
+			return {
+				htmlLen: htmlLen,
+				has403: pageText.includes('403') || pageText.includes('Forbidden') || pageText.includes('Denied'),
+				hasError: pageText.includes('出了点问题') || pageText.includes('went wrong'),
+				isAuthPage: window.location.href.includes('auth.business.gemini'),
+				url: window.location.href
+			};
+		}`)
+
+		if pageState != nil {
+			has403 := pageState.Value.Get("has403").Bool()
+			hasError := pageState.Value.Get("hasError").Bool()
+			htmlLen := pageState.Value.Get("htmlLen").Int()
+			isAuthPage := pageState.Value.Get("isAuthPage").Bool()
+
+			if has403 || htmlLen < 500 {
+				result.Error = fmt.Errorf("代理403/被阻止，页面未正常加载")
+				return result
+			}
+			if hasError {
+				result.Error = fmt.Errorf("页面显示错误，可能被IP限制")
+				return result
+			}
+			if isAuthPage && htmlLen < 2000 {
+				time.Sleep(5 * time.Second)
+				for _, sel := range selectors {
+					el, err := page.Timeout(3 * time.Second).Element(sel)
+					if err == nil && el != nil {
+						if visible, _ := el.Visible(); visible {
+							emailInput = el
+							break
+						}
+					}
+				}
+			}
 		}
-		log.Printf("[注册 %d] ❌ 找不到邮箱输入框，页面HTML片段: %s", threadID, html)
-		result.Error = fmt.Errorf("找不到邮箱输入框")
-		return result
+
+		if emailInput == nil {
+			html, _ := page.HTML()
+			if len(html) > 2000 {
+				html = html[:2000]
+			}
+			log.Printf("[注册 %d] ❌ 找不到邮箱输入框，页面HTML片段: %s", threadID, html)
+			result.Error = fmt.Errorf("找不到邮箱输入框（页面未正常加载）")
+			return result
+		}
 	}
 
 	// 获取元素信息
@@ -1409,6 +1498,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		maxResend := 3
 		lastEmailCheck := time.Time{}
 		emailCheckInterval := 3 * time.Second
+		codePageStableTime := time.Time{} // 验证码页面稳定时间
 
 		for time.Since(startTime) < maxWaitTime {
 			// 检查页面状态
@@ -1516,8 +1606,12 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 			// 在验证码页面
 			if isCodePage {
-				// 如果验证码页面有错误（验证码错误、过期等），点击重发
-				if hasCodeError && hasResendBtn && resendCount < maxResend {
+				// 首次进入验证码页面，记录时间
+				if codePageStableTime.IsZero() {
+					codePageStableTime = time.Now()
+				}
+				pageStableDuration := time.Since(codePageStableTime)
+				if hasCodeError && hasResendBtn && resendCount < maxResend && pageStableDuration > 5*time.Second {
 					log.Printf("[注册 %d] 验证码页面出现错误，点击重发 (%d/%d)", threadID, resendCount+1, maxResend)
 					page.Eval(`() => {
 						const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
@@ -1534,8 +1628,6 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 					time.Sleep(3 * time.Second)
 					continue
 				}
-
-				// 正常检查邮件（限制检查频率）
 				if time.Since(lastEmailCheck) >= emailCheckInterval {
 					emailContent, _ = getVerificationEmailQuick(email, 1, 2)
 					lastEmailCheck = time.Now()
@@ -1610,33 +1702,33 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		if firstCodeInput == nil {
 			log.Printf("[注册 %d] ⚠️ 未找到验证码输入框", threadID)
 		} else {
-			// 点击获取焦点
-			if err := firstCodeInput.Click(proto.InputMouseButtonLeft, 1); err != nil {
-				log.Printf("[注册 %d] 点击验证码输入框失败: %v", threadID, err)
-			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[注册 %d] 点击验证码框异常: %v", threadID, r)
+					}
+				}()
+				firstCodeInput.Click(proto.InputMouseButtonLeft, 1)
+			}()
 			time.Sleep(300 * time.Millisecond)
 
-			// 清空输入框
-			firstCodeInput.SelectAllText()
-			firstCodeInput.MustInput("")
+			// 清空输入框（带超时保护）
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[注册 %d] 清空验证码框异常: %v", threadID, r)
+					}
+				}()
+				firstCodeInput.SelectAllText()
+				firstCodeInput.Input("")
+			}()
 			time.Sleep(200 * time.Millisecond)
 
-			if isOTP {
-				// OTP风格：逐字符键盘输入，带延迟让页面自动跳转
-				for i, char := range code {
-					page.Keyboard.Type(input.Key(char))
-					if i < len(code)-1 {
-						time.Sleep(time.Duration(100+rand.Intn(100)) * time.Millisecond)
-					}
-				}
-			} else {
-				// 单个输入框：使用 rod Input
-				if err := firstCodeInput.Input(code); err != nil {
-					log.Printf("[注册 %d] 验证码 Input 失败: %v, 使用键盘输入", threadID, err)
-					for _, char := range code {
-						page.Keyboard.Type(input.Key(char))
-						time.Sleep(time.Duration(20+rand.Intn(30)) * time.Millisecond)
-					}
+			// 直接使用键盘输入（更可靠）
+			for i, char := range code {
+				page.Keyboard.Type(input.Key(char))
+				if i < len(code)-1 {
+					time.Sleep(time.Duration(80+rand.Intn(80)) * time.Millisecond)
 				}
 			}
 			log.Printf("[注册 %d] 验证码输入完成", threadID)

@@ -52,6 +52,7 @@ type ProxyNode struct {
 	LastCheck time.Time
 	LocalPort int
 	Latency   time.Duration
+	ExitIP    string
 
 	// Reality 相关
 	Flow        string // xtls-rprx-vision
@@ -60,6 +61,11 @@ type ProxyNode struct {
 	ShortId     string // reality sid
 	SpiderX     string // reality spx
 	ALPN        string
+
+	// 使用统计
+	LastUsed    time.Time     // 最后使用时间
+	FailCount   int           // 连续失败次数
+	UseCooldown time.Duration // 使用冷却时间（失败后动态调整）
 }
 
 // InstanceStatus 实例状态
@@ -90,7 +96,6 @@ type ProxyManager struct {
 	mu             sync.RWMutex
 	nodes          []*ProxyNode
 	healthyNodes   []*ProxyNode
-	currentIndex   int
 	basePort       int
 	instances      map[int]*XrayInstance
 	instancePool   []*XrayInstance // 预启动的实例池
@@ -107,11 +112,20 @@ type ProxyManager struct {
 	healthChecking bool       // 是否正在健康检查
 }
 
+// 默认代理使用冷却时间
+var (
+	DefaultProxyUseCooldown = 5 * time.Second // 默认使用冷却
+	MaxProxyFailCount       = 3               // 最大连续失败次数，超过后增加冷却
+	DefaultProxyCount       = 5               // 默认代理池大小
+	MinHealthyForReady      = 1               // 最少健康节点数才提示就绪（改为1，更快就绪）
+	HealthCheckTimeout      = 8 * time.Second // 健康检查超时
+)
+
 var Manager = &ProxyManager{
 	basePort:       10800,
 	instances:      make(map[int]*XrayInstance),
 	instancePool:   make([]*XrayInstance, 0),
-	maxPoolSize:    5, // 默认预启动5个实例
+	maxPoolSize:    5,
 	updateInterval: 30 * time.Minute,
 	checkInterval:  5 * time.Minute,
 	healthCheckURL: "https://www.google.com/generate_204",
@@ -293,8 +307,6 @@ func (si *SubscriptionInfo) getRemainingTraffic() int64 {
 	}
 	return si.Total - si.Upload - si.Download
 }
-
-// loadFromURL 从URL加载（检查流量信息，过滤0流量订阅）
 func (pm *ProxyManager) loadFromURL(urlStr string) ([]*ProxyNode, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(urlStr)
@@ -310,13 +322,6 @@ func (pm *ProxyManager) loadFromURL(urlStr string) ([]*ProxyNode, error) {
 	}
 	if subInfo := parseSubscriptionUserinfo(userinfo); subInfo != nil {
 		remaining := subInfo.getRemainingTraffic()
-		// usedGB := float64(subInfo.Upload+subInfo.Download) / (1024 * 1024 * 1024)
-		// totalGB := float64(subInfo.Total) / (1024 * 1024 * 1024)
-		// remainGB := float64(remaining) / (1024 * 1024 * 1024)
-
-		// log.Printf("📊 [订阅] 流量信息: 已用 %.2fGB / 总共 %.2fGB, 剩余 %.2fGB", usedGB, totalGB, remainGB)
-
-		// 过滤0流量订阅
 		if remaining == 0 {
 			return nil, fmt.Errorf("订阅流量已耗尽")
 		}
@@ -606,6 +611,70 @@ func parseVless(link string) *ProxyNode {
 	return node
 }
 
+// xray-core 支持的 shadowsocks 加密方法
+var supportedSSCiphers = map[string]bool{
+	// AEAD 加密（推荐）
+	"aes-128-gcm":             true,
+	"aes-256-gcm":             true,
+	"chacha20-poly1305":       true,
+	"chacha20-ietf-poly1305":  true,
+	"xchacha20-poly1305":      true,
+	"xchacha20-ietf-poly1305": true,
+	// 流式加密（xray-core 支持）
+	"aes-128-ctr": true,
+	"aes-192-ctr": true,
+	"aes-256-ctr": true,
+	// 其他支持的
+	"none":                          true,
+	"plain":                         true,
+	"2022-blake3-aes-128-gcm":       true,
+	"2022-blake3-aes-256-gcm":       true,
+	"2022-blake3-chacha20-poly1305": true,
+}
+
+// 不支持的 cipher 方法映射（旧的 CFB/OFB 等）
+var unsupportedSSCiphers = map[string]string{
+	"aes-128-cfb":   "", // 不支持，跳过
+	"aes-192-cfb":   "",
+	"aes-256-cfb":   "",
+	"aes-128-ofb":   "",
+	"aes-192-ofb":   "",
+	"aes-256-ofb":   "",
+	"bf-cfb":        "",
+	"cast5-cfb":     "",
+	"des-cfb":       "",
+	"idea-cfb":      "",
+	"rc2-cfb":       "",
+	"rc4":           "",
+	"rc4-md5":       "",
+	"rc4-md5-6":     "",
+	"seed-cfb":      "",
+	"salsa20":       "",
+	"chacha20":      "chacha20-ietf-poly1305", // 尝试升级
+	"chacha20-ietf": "chacha20-ietf-poly1305",
+}
+
+// isSupportedSSCipher 检查是否支持的 cipher
+func isSupportedSSCipher(method string) bool {
+	method = strings.ToLower(method)
+	return supportedSSCiphers[method]
+}
+
+// tryMapSSCipher 尝试映射不支持的 cipher 到支持的
+func tryMapSSCipher(method string) (string, bool) {
+	method = strings.ToLower(method)
+	if isSupportedSSCipher(method) {
+		return method, true
+	}
+	if mapped, ok := unsupportedSSCiphers[method]; ok {
+		if mapped == "" {
+			return "", false // 不支持且无法映射
+		}
+		return mapped, true
+	}
+	return "", false
+}
+
 // parseSS 解析 ss 链接
 func parseSS(link string) *ProxyNode {
 	// 支持多种格式:
@@ -692,6 +761,15 @@ func parseSS(link string) *ProxyNode {
 	// 验证必要字段
 	if node.Server == "" || node.Port == 0 || node.Method == "" {
 		return nil
+	}
+
+	// 检查并映射 cipher 方法
+	if mappedMethod, ok := tryMapSSCipher(node.Method); ok {
+		if mappedMethod != node.Method {
+			node.Method = mappedMethod
+		}
+	} else {
+		return nil // 跳过不支持的节点
 	}
 	return node
 }
@@ -876,9 +954,24 @@ func parseDirectProxy(link string) *ProxyNode {
 
 // startInstanceLocked 内部方法：启动实例（需要持有锁）
 func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*XrayInstance, error) {
-	// xray-core 不支持的协议，直接跳过
-	if node.Protocol == "hysteria2" || node.Protocol == "hy2" || node.Protocol == "anytls" {
-		return nil, fmt.Errorf("协议 %s 不被 xray-core 支持", node.Protocol)
+	// sing-box 支持的协议（hysteria2/tuic 等）
+	if IsSingboxProtocol(node.Protocol) {
+		sm := GetSingboxManager()
+		if !sm.IsAvailable() {
+			return nil, fmt.Errorf("协议 %s 需要 sing-box，但 sing-box 不可用", node.Protocol)
+		}
+		proxyURL, err := sm.Start(node)
+		if err != nil {
+			return nil, fmt.Errorf("sing-box 启动失败: %w", err)
+		}
+		return &XrayInstance{
+			node:      node,
+			running:   true,
+			status:    InstanceStatusIdle,
+			proxyURL:  proxyURL,
+			lastUsed:  time.Now(),
+			localPort: node.LocalPort,
+		}, nil
 	}
 
 	// 直接代理不需要 xray
@@ -908,6 +1001,21 @@ func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*XrayInstance, err
 	// 生成 xray 配置
 	xrayConfig := pm.buildXrayConfig(node, localPort)
 	if xrayConfig == nil {
+		// xray 配置生成失败，尝试 sing-box
+		if CanSingboxHandle(node.Protocol) {
+			log.Printf("⚠️ [%s] xray 配置失败，尝试 sing-box", node.Name)
+			proxyURL, err := TrySingboxStart(node)
+			if err == nil {
+				return &XrayInstance{
+					node:      node,
+					running:   true,
+					status:    InstanceStatusIdle,
+					proxyURL:  proxyURL,
+					lastUsed:  time.Now(),
+					localPort: node.LocalPort,
+				}, nil
+			}
+		}
 		return nil, fmt.Errorf("生成配置失败")
 	}
 
@@ -916,16 +1024,46 @@ func (pm *ProxyManager) startInstanceLocked(node *ProxyNode) (*XrayInstance, err
 	server, err := core.New(xrayConfig)
 	if err != nil {
 		cancel()
+		// xray 创建失败，尝试 sing-box
+		if CanSingboxHandle(node.Protocol) {
+			log.Printf("⚠️ [%s] xray 创建失败: %v，尝试 sing-box", node.Name, err)
+			proxyURL, sbErr := TrySingboxStart(node)
+			if sbErr == nil {
+				return &XrayInstance{
+					node:      node,
+					running:   true,
+					status:    InstanceStatusIdle,
+					proxyURL:  proxyURL,
+					lastUsed:  time.Now(),
+					localPort: node.LocalPort,
+				}, nil
+			}
+		}
 		return nil, fmt.Errorf("创建 xray 实例失败: %w", err)
 	}
 
 	if err := server.Start(); err != nil {
 		cancel()
+		// xray 启动失败，尝试 sing-box
+		if CanSingboxHandle(node.Protocol) {
+			log.Printf("⚠️ [%s] xray 启动失败: %v，尝试 sing-box", node.Name, err)
+			proxyURL, sbErr := TrySingboxStart(node)
+			if sbErr == nil {
+				return &XrayInstance{
+					node:      node,
+					running:   true,
+					status:    InstanceStatusIdle,
+					proxyURL:  proxyURL,
+					lastUsed:  time.Now(),
+					localPort: node.LocalPort,
+				}, nil
+			}
+		}
 		return nil, fmt.Errorf("启动 xray 失败: %w", err)
 	}
 
 	// 等待端口可用并验证
-	proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", localPort)
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", localPort)
 	for i := 0; i < 10; i++ {
 		time.Sleep(50 * time.Millisecond)
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 100*time.Millisecond)
@@ -1091,10 +1229,8 @@ func (pm *ProxyManager) generateXrayConfig(node *ProxyNode, localPort int) strin
 		"inbounds": [{
 			"port": %d,
 			"listen": "127.0.0.1",
-			"protocol": "socks",
-			"settings": {
-				"udp": true
-			}
+			"protocol": "http",
+			"settings": {}
 		}],
 		"outbounds": [%s]
 	}`, localPort, outbound)
@@ -1265,7 +1401,63 @@ func (pm *ProxyManager) StopAll() {
 	}
 	log.Printf("🛑 所有 xray 实例已停止")
 }
+
+// CheckHealth 检查节点健康并获取出口IP
 func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
+	proxyURL, err := pm.StartXray(node)
+	if err != nil {
+		log.Printf("⚠️ [%s] 启动失败: %v", node.Name, err)
+		return false
+	}
+	defer func() {
+		if node.Protocol != "http" && node.Protocol != "https" && node.Protocol != "socks5" {
+			pm.StopXray(node.LocalPort)
+		}
+	}()
+
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+	if proxyURL != "" {
+		proxy, _ := url.Parse(proxyURL)
+		transport.Proxy = http.ProxyURL(proxy)
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   HealthCheckTimeout,
+	}
+
+	// 第一步：基本连通性检查
+	start := time.Now()
+	resp, err := client.Get(pm.healthCheckURL)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != 204 && resp.StatusCode != 200 {
+		return false
+	}
+	node.Latency = time.Since(start)
+	ipClient := &http.Client{
+		Transport: transport,
+		Timeout:   3 * time.Second, 
+	}
+	ipResp, err := ipClient.Get("https://ipinfo.io/ip")
+	if err != nil {
+		return true 
+	}
+	defer ipResp.Body.Close()
+
+	if ipResp.StatusCode == 200 {
+		ipBytes, _ := io.ReadAll(ipResp.Body)
+		node.ExitIP = strings.TrimSpace(string(ipBytes))
+	}
+
+	return true
+}
+func (pm *ProxyManager) CheckHealthQuick(node *ProxyNode) bool {
 	proxyURL, err := pm.StartXray(node)
 	if err != nil {
 		return false
@@ -1286,14 +1478,16 @@ func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   10 * time.Second,
+		Timeout:   5 * time.Second,
 	}
 
+	start := time.Now()
 	resp, err := client.Get(pm.healthCheckURL)
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	resp.Body.Close()
+	node.Latency = time.Since(start)
 
 	return resp.StatusCode == 204 || resp.StatusCode == 200
 }
@@ -1325,50 +1519,111 @@ func (pm *ProxyManager) CheckAllHealth() {
 		pm.SetReady(true)
 		return
 	}
-
+	var healthyNodes, unhealthyNodes, newNodes []*ProxyNode
+	for _, n := range nodes {
+		if n.LastCheck.IsZero() {
+			newNodes = append(newNodes, n)
+		} else if n.Healthy {
+			healthyNodes = append(healthyNodes, n)
+		} else {
+			unhealthyNodes = append(unhealthyNodes, n)
+		}
+	}
 	var healthy []*ProxyNode
 	var checked int32
-	var wg sync.WaitGroup
+	var mainWg sync.WaitGroup
 	var mu sync.Mutex
-
+	ipSeen := make(map[string]bool)
 	total := len(nodes)
-	log.Printf("🔍 开始检查 %d 个节点...", total)
-	sem := make(chan struct{}, 64)
 
-	for _, node := range nodes {
-		wg.Add(1)
-		go func(n *ProxyNode) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+	// 检查单个节点的函数
+	checkNode := func(n *ProxyNode, sem chan struct{}) {
+		sem <- struct{}{}
+		defer func() { <-sem }()
 
-			n.Healthy = pm.CheckHealth(n)
-			n.LastCheck = time.Now()
+		n.Healthy = pm.CheckHealth(n)
+		n.LastCheck = time.Now()
 
-			current := int(atomic.AddInt32(&checked, 1))
+		current := int(atomic.AddInt32(&checked, 1))
 
-			mu.Lock()
-			if n.Healthy {
+		mu.Lock()
+		if n.Healthy {
+			if n.ExitIP != "" {
+				if ipSeen[n.ExitIP] {
+					for i, existing := range healthy {
+						if existing.ExitIP == n.ExitIP && n.Latency < existing.Latency {
+							healthy[i] = n
+							break
+						}
+					}
+				} else {
+					ipSeen[n.ExitIP] = true
+					healthy = append(healthy, n)
+				}
+			} else {
 				healthy = append(healthy, n)
+			}
+			if len(healthy) >= MinHealthyForReady {
 				pm.mu.Lock()
-				pm.healthyNodes = append(pm.healthyNodes, n)
-				if !pm.ready && len(pm.healthyNodes) > 0 {
+				if !pm.ready {
 					pm.ready = true
+					pm.healthyNodes = healthy
 					pm.readyCond.Broadcast()
 				}
 				pm.mu.Unlock()
 			}
-			healthyCount := len(healthy)
-			mu.Unlock()
+		}
+		healthyCount := len(healthy)
+		mu.Unlock()
 
-			// 每 50 个或完成时输出进度
-			if current%50 == 0 || current == total {
-				log.Printf("🔍 进度: %d/%d, 健康: %d", current, total, healthyCount)
-			}
-		}(node)
+		if current%50 == 0 || current == total {
+			log.Printf("🔍 进度: %d/%d, 健康: %d", current, total, healthyCount)
+		}
 	}
+	mainWg.Add(1)
+	go func() {
+		defer mainWg.Done()
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 32)
+		for _, n := range healthyNodes {
+			wg.Add(1)
+			go func(node *ProxyNode) {
+				defer wg.Done()
+				checkNode(node, sem)
+			}(n)
+		}
+		wg.Wait()
+	}()
+	mainWg.Add(1)
+	go func() {
+		defer mainWg.Done()
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 32)
+		for _, n := range unhealthyNodes {
+			wg.Add(1)
+			go func(node *ProxyNode) {
+				defer wg.Done()
+				checkNode(node, sem)
+			}(n)
+		}
+		wg.Wait()
+	}()
+	mainWg.Add(1)
+	go func() {
+		defer mainWg.Done()
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 32)
+		for _, n := range newNodes {
+			wg.Add(1)
+			go func(node *ProxyNode) {
+				defer wg.Done()
+				checkNode(node, sem)
+			}(n)
+		}
+		wg.Wait()
+	}()
 
-	wg.Wait()
+	mainWg.Wait()
 
 	// 按延迟排序（延迟低的排前面）
 	sort.Slice(healthy, func(i, j int) bool {
@@ -1378,22 +1633,36 @@ func (pm *ProxyManager) CheckAllHealth() {
 	pm.mu.Lock()
 	pm.healthyNodes = healthy
 	pm.healthChecking = false
-	pm.ready = len(healthy) > 0
+	// 只有达到最少健康节点数才提示就绪
+	pm.ready = len(healthy) >= MinHealthyForReady
 	pm.readyCond.Broadcast()
 	pm.mu.Unlock()
 
-	// 输出前5个最快节点
+	// 输出健康检查结果
+	uniqueIPs := len(ipSeen)
 	if len(healthy) > 0 {
 		topN := 5
 		if len(healthy) < topN {
 			topN = len(healthy)
 		}
-		log.Printf("✅ 健康检查完成: %d/%d 节点可用, 最快前%d: %v~%v",
-			len(healthy), len(nodes), topN,
-			healthy[0].Latency.Round(time.Millisecond),
+		log.Printf("✅ 健康检查完成: %d/%d 节点可用 ",
+			len(healthy), total)
+		log.Printf("📊 最快前%d节点: %v ~ %v",
+			topN, healthy[0].Latency.Round(time.Millisecond),
 			healthy[topN-1].Latency.Round(time.Millisecond))
+
+		// 输出IP分布信息
+		if uniqueIPs < len(healthy) {
+		}
 	} else {
-		log.Printf("✅ 健康检查完成: %d/%d 节点可用", len(healthy), len(nodes))
+		log.Printf("⚠️ 健康检查完成: 0/%d 节点可用", total)
+	}
+
+	// 就绪状态提示
+	if pm.ready {
+		log.Printf("🟢 代理池就绪 (健康节点: %d >= 最低要求: %d)", len(healthy), MinHealthyForReady)
+	} else {
+		log.Printf("🔴 代理池未就绪 (健康节点: %d < 最低要求: %d)", len(healthy), MinHealthyForReady)
 	}
 }
 
@@ -1442,7 +1711,6 @@ func (pm *ProxyManager) ReleaseByURL(proxyURL string) {
 	}
 }
 
-// Next 获取下一个健康代理（优先从池中获取）
 func (pm *ProxyManager) Next() string {
 	// 首先尝试从池中获取
 	if inst := pm.GetFromPool(); inst != nil {
@@ -1452,32 +1720,76 @@ func (pm *ProxyManager) Next() string {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	if len(pm.healthyNodes) == 0 {
-		// 如果没有健康节点，尝试使用所有节点
-		if len(pm.nodes) == 0 {
-			return ""
-		}
-		node := pm.nodes[pm.currentIndex%len(pm.nodes)]
-		pm.currentIndex++
-
-		// 尝试启动新实例
-		instance, err := pm.startInstanceLocked(node)
-		if err != nil {
-			log.Printf("⚠️ 启动代理失败: %v", err)
-			return ""
-		}
-		instance.status = InstanceStatusInUse
-		pm.instancePool = append(pm.instancePool, instance)
-		return instance.proxyURL
+	nodes := pm.healthyNodes
+	if len(nodes) == 0 {
+		nodes = pm.nodes
+	}
+	if len(nodes) == 0 {
+		return ""
 	}
 
-	node := pm.healthyNodes[pm.currentIndex%len(pm.healthyNodes)]
-	pm.currentIndex++
+	now := time.Now()
+
+	// 筛选可用节点（不在冷却中且失败次数不超限）
+	var availableNodes []*ProxyNode
+	var cooldownNodes []*ProxyNode
+	for _, node := range nodes {
+		// 检查冷却时间
+		cooldown := node.UseCooldown
+		if cooldown == 0 {
+			cooldown = DefaultProxyUseCooldown
+		}
+		if now.Sub(node.LastUsed) < cooldown {
+			cooldownNodes = append(cooldownNodes, node)
+			continue
+		}
+		// 失败次数过多的节点也加入备选，但优先级低
+		if node.FailCount < MaxProxyFailCount {
+			availableNodes = append(availableNodes, node)
+		} else {
+			cooldownNodes = append(cooldownNodes, node)
+		}
+	}
+
+	// 如果没有可用节点，使用冷却中最久未用的
+	if len(availableNodes) == 0 {
+		if len(cooldownNodes) == 0 {
+			return ""
+		}
+		// 找最久未用的
+		oldest := cooldownNodes[0]
+		for _, n := range cooldownNodes[1:] {
+			if n.LastUsed.Before(oldest.LastUsed) {
+				oldest = n
+			}
+		}
+		availableNodes = []*ProxyNode{oldest}
+	}
+
+	// 随机选择：从前30%低延迟节点中随机选择，避免总是用同一个
+	topCount := len(availableNodes) * 30 / 100
+	if topCount < 3 {
+		topCount = len(availableNodes)
+		if topCount > 3 {
+			topCount = 3
+		}
+	}
+	if topCount > len(availableNodes) {
+		topCount = len(availableNodes)
+	}
+
+	// 随机选一个
+	randIdx, _ := rand.Int(rand.Reader, big.NewInt(int64(topCount)))
+	node := availableNodes[randIdx.Int64()]
+	node.LastUsed = now
 
 	// 启动新实例
 	instance, err := pm.startInstanceLocked(node)
 	if err != nil {
 		log.Printf("⚠️ 启动代理失败: %v", err)
+		node.FailCount++
+		// 失败后增加冷却时间
+		node.UseCooldown = time.Duration(node.FailCount) * 10 * time.Second
 		return ""
 	}
 	instance.status = InstanceStatusInUse
@@ -1487,6 +1799,41 @@ func (pm *ProxyManager) Next() string {
 		pm.instancePool = append(pm.instancePool, instance)
 	}
 	return instance.proxyURL
+}
+
+// MarkProxyFailed 标记代理失败（如403等）
+func (pm *ProxyManager) MarkProxyFailed(proxyURL string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	// 从实例池找到对应节点
+	for _, inst := range pm.instancePool {
+		if inst.proxyURL == proxyURL && inst.node != nil {
+			inst.node.FailCount++
+			// 失败后动态增加冷却时间
+			inst.node.UseCooldown = time.Duration(inst.node.FailCount) * 15 * time.Second
+			if inst.node.UseCooldown > 2*time.Minute {
+				inst.node.UseCooldown = 2 * time.Minute
+			}
+			log.Printf("⚠️ 代理失败标记: %s, 失败次数=%d, 冷却=%v",
+				inst.node.Name, inst.node.FailCount, inst.node.UseCooldown)
+			return
+		}
+	}
+}
+
+// MarkProxySuccess 标记代理成功（重置失败计数）
+func (pm *ProxyManager) MarkProxySuccess(proxyURL string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	for _, inst := range pm.instancePool {
+		if inst.proxyURL == proxyURL && inst.node != nil {
+			inst.node.FailCount = 0
+			inst.node.UseCooldown = DefaultProxyUseCooldown
+			return
+		}
+	}
 }
 
 // PoolStats 返回实例池统计
