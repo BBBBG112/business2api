@@ -59,6 +59,11 @@
 >
 > 测试 API Key（公共测试用）：
 > `sk-3d2f9b84e7f510b1a08f7b3d6c9a6a7f17fbbad5624ea29f22d9c742bf39c863`
+> GLM 公益测试 API
+> 🔗 链接：<https://GLM.openel.top>
+> API Key : `sk-3d2f9b84e7f510b1a08f7b3d6c9a6a7f17fbbad5624ea29f22d9c742bf39c863`
+
+
 
 ## 快速开始
 
