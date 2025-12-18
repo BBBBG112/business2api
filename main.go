@@ -37,8 +37,7 @@ import (
 )
 
 // ==================== 配置结构 ====================
-
-输入 PoolConfig struct {
+type PoolConfig struct {
 	TargetCount            int  `json:"target_count"`              // 目标账号数量
 	MinCount               int  `json:"min_count"`                 // 最小账号数，低于此值触发注册
 	CheckIntervalMinutes   int  `json:"check_interval_minutes"`    // 检查间隔(分钟)
@@ -55,8 +54,8 @@ import (
 }
 
 // FlowConfig Flow 服务配置
-输入 FlowConfigSection struct {
-	启用          bool     `json:"enable"`            // 是否启用 Flow
+type FlowConfigSection struct {
+	Enable          bool     `json:"enable"`            // 是否启用 Flow
 	Tokens          []string `json:"tokens"`            // Flow ST Tokens
 	Proxy           string   `json:"proxy"`             // Flow 专用代理
 	Timeout         int      `json:"timeout"`           // 超时时间
@@ -989,6 +988,8 @@ var BaseModels = []string{
 	"gemini-3-flash-preview-image",
 	"gemini-3-flash-preview-video",
 	"gemini-3-flash-preview-search",
+
+	"gemini-3-flash",
 	"gemini-3-flash-image",
 	"gemini-3-flash-video",
 	"gemini-3-flash-search",

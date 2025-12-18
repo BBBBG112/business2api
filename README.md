@@ -21,12 +21,17 @@
 
 ## 📦 支持的模型
 
+### Gemini Business 模型
+
 | 模型 | 文本 | 图片生成 | 视频生成 | 搜索 |
 |------|:----:|:--------:|:--------:|:----:|
 | gemini-2.5-flash | ✅ | ✅ | ✅ | ✅ |
 | gemini-2.5-pro | ✅ | ✅ | ✅ | ✅ |
+| gemini-2.5-flash-preview-latest | ✅ | ✅ | ✅ | ✅ |
 | gemini-3-pro-preview | ✅ | ✅ | ✅ | ✅ |
 | gemini-3-pro | ✅ | ✅ | ✅ | ✅ |
+| gemini-3-flash-preview | ✅ | ✅ | ✅ | ✅ |
+| gemini-3-flash | ✅ | ✅ | ✅ | ✅ |
 
 ### 功能后缀
 
@@ -191,7 +196,8 @@ sudo systemctl start business2api
     "max_fail_count": 3,               // 最大连续失败次数
     "enable_browser_refresh": true,    // 启用浏览器刷新401账号
     "browser_refresh_headless": true,  // 浏览器刷新无头模式
-    "browser_refresh_max_retry": 1     // 浏览器刷新最大重试次数
+    "browser_refresh_max_retry": 1,    // 浏览器刷新最大重试次数
+    "auto_delete_401": false           // 401时自动删除账号
   },
 
   "pool_server": {                     
@@ -413,12 +419,9 @@ curl http://localhost:8000/v1/chat/completions \
 
 ---
 
-
----
-
 ## Flow 图片/视频生成
 
-Flow 集成了 Google VideoFX (Veo) API，支持图片和视频生成。
+Flow 集成了 Google VideoFX (Veo/Imagen) API，支持图片和视频生成。
 
 ### 配置
 
@@ -426,21 +429,55 @@ Flow 集成了 Google VideoFX (Veo) API，支持图片和视频生成。
 {
   "flow": {
     "enable": true,
-    "tokens": ["your-flow-st-token"],  // labs.google/fx 登录后的 ST Cookie
-    "proxy": "",
-    "timeout": 120,
-    "poll_interval": 3,
-    "max_poll_attempts": 500
+    "tokens": [],              // 配置文件中的 Token（可选）
+    "proxy": "",               // Flow 专用代理
+    "timeout": 120,            // 超时时间(秒)
+    "poll_interval": 3,        // 轮询间隔(秒)
+    "max_poll_attempts": 500   // 最大轮询次数
   }
 }
 ```
 
 ### 获取 Flow Token
 
+**方式一：文件目录（推荐）**
+
+将完整的 cookie 字符串保存到 `data/at/` 目录下的任意 `.txt` 文件：
+
+```bash
+mkdir -p data/at
+echo "your-cookie-string" > data/at/account1.txt
+```
+
+服务启动时自动加载，支持文件监听自动热加载。
+
+**方式二：API 添加**
+
+```bash
+curl -X POST http://localhost:8000/admin/flow/add-token \
+  -H "Authorization: Bearer sk-xxx" \
+  -d '{"cookie": "your-cookie-string"}'
+```
+
+**Cookie 获取方法：**
 1. 访问 [labs.google/fx](https://labs.google/fx) 并登录
 2. 打开开发者工具 → Application → Cookies
-3. 复制 `__Secure-next-auth.session-token` 的值
-4. 添加到配置文件的 `flow.tokens` 数组
+3. 复制所有 cookie 或 `__Secure-next-auth.session-token` 的值
+
+### Flow 模型列表
+
+| 模型 | 类型 | 说明 |
+|------|------|------|
+| `gemini-2.5-flash-image-landscape/portrait` | 图片 | Gemini 2.5 Flash 图片生成 |
+| `gemini-3.0-pro-image-landscape/portrait` | 图片 | Gemini 3.0 Pro 图片生成 |
+| `imagen-4.0-generate-preview-landscape/portrait` | 图片 | Imagen 4.0 图片生成 |
+| `veo_3_1_t2v_fast_landscape/portrait` | 视频 | Veo 3.1 文生视频 |
+| `veo_2_1_fast_d_15_t2v_landscape/portrait` | 视频 | Veo 2.1 文生视频 |
+| `veo_2_0_t2v_landscape/portrait` | 视频 | Veo 2.0 文生视频 |
+| `veo_3_1_i2v_s_fast_fl_landscape/portrait` | 视频 | Veo 3.1 图生视频 (I2V) |
+| `veo_2_1_fast_d_15_i2v_landscape/portrait` | 视频 | Veo 2.1 图生视频 (I2V) |
+| `veo_2_0_i2v_landscape/portrait` | 视频 | Veo 2.0 图生视频 (I2V) |
+| `veo_3_0_r2v_fast_landscape/portrait` | 视频 | Veo 3.0 多图生视频 (R2V) |
 
 ### 使用示例
 
@@ -448,11 +485,30 @@ Flow 集成了 Google VideoFX (Veo) API，支持图片和视频生成。
 # 图片生成
 curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
   -d '{"model": "gemini-2.5-flash-image-landscape", "messages": [{"role": "user", "content": "一只可爱的猫咪"}], "stream": true}'
 
-# 视频生成
+# 文生视频 (T2V)
 curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
   -d '{"model": "veo_3_1_t2v_fast_landscape", "messages": [{"role": "user", "content": "猫咪在草地上追蝴蝶"}], "stream": true}'
+
+# 图生视频 (I2V) - 支持首尾帧
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "veo_3_1_i2v_s_fast_fl_landscape",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "猫咪跳跃"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+      ]
+    }],
+    "stream": true
+  }'
 ```
 
 ---
@@ -534,6 +590,12 @@ curl http://localhost:8000/v1/chat/completions \
 | `/admin/reload-config` | POST | 热重载配置文件 |
 | `/admin/force-refresh` | POST | 强制刷新所有账号 |
 | `/admin/config/cooldown` | POST | 动态调整冷却时间 |
+| `/admin/browser-refresh` | POST | 手动触发浏览器刷新指定账号 |
+| `/admin/config/browser-refresh` | POST | 配置浏览器刷新开关 |
+| `/admin/flow/status` | GET | Flow 服务状态 |
+| `/admin/flow/add-token` | POST | 添加 Flow Token |
+| `/admin/flow/remove-token` | POST | 移除 Flow Token |
+| `/admin/flow/reload` | POST | 重新加载 Flow Token |
 
 ---
 
@@ -592,7 +654,7 @@ GOOS=darwin GOARCH=arm64 go build -tags "with_quic with_utls" -o business2api-da
 
 ---
 
-## � IP 遥测接口
+## 📊 IP 遥测接口
 
 访问 `/admin/ip` 获取全部 IP 请求统计：
 
@@ -617,6 +679,6 @@ curl http://localhost:8000/admin/ip \
 
 ---
 
-## �📄 License
+## 📄 License
 
 MIT License
