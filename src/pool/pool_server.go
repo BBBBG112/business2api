@@ -9,16 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"business2api/src/logger"
 
 	"github.com/gorilla/websocket"
 )
-
-// ==================== 号池服务器（C/S架构 + WebSocket） ====================
-// Server: 管理端 - 负责API服务、账号分配、状态监控
-// Client: 工作端 - 负责注册新账号、401账号Cookie续期
 
 // PoolServerConfig 号池服务器配置
 type PoolServerConfig struct {
@@ -49,12 +46,13 @@ const (
 	WSMsgHeartbeatAck   WSMessageType = "heartbeat_ack"   // 心跳响应
 	WSMsgClientReady    WSMessageType = "client_ready"    // 客户端就绪
 	WSMsgRequestTask    WSMessageType = "request_task"    // 请求任务
+	WSMsgQueryStatus    WSMessageType = "query_status"    // 查询状态（客户端自主模式）
 )
 
 // 版本信息
 const (
 	ProtocolVersion = "1.0"
-	ServerVersion   = "2.0.0"
+	ServerVersion   = "4.0.0"
 )
 
 // WSMessage WebSocket消息
@@ -92,6 +90,9 @@ type PoolServer struct {
 
 	// 轮询分配
 	nextClientIdx int // 下一个分配任务的客户端索引
+
+	// 正在进行中的注册任务计数
+	pendingRegisterCount int32
 }
 
 // NewPoolServer 创建号池服务器
@@ -149,13 +150,20 @@ func (ps *PoolServer) Start() error {
 	go ps.taskDispatcher()
 	// 启动心跳检测
 	go ps.heartbeatChecker()
+	// 启动定时任务广播（每半小时）
+	go ps.periodicTaskBroadcaster()
+	// 启动号池维护（缺账号就下发）
+	go ps.poolMaintainer()
 	return http.ListenAndServe(ps.config.ListenAddr, mux)
 }
 
-// StartBackground 启动后台任务（任务分发和心跳检测）
+// StartBackground 启动后台任务（任务分发、心跳检测、定时广播、账号扫描）
 func (ps *PoolServer) StartBackground() {
 	go ps.taskDispatcher()
 	go ps.heartbeatChecker()
+	go ps.periodicTaskBroadcaster()
+	go ps.periodicAccountScanner()
+	go ps.poolMaintainer()
 }
 
 // HandleWS 处理 WebSocket 连接（供 gin 路由使用）
@@ -314,6 +322,10 @@ func (c *WSClient) handleMessage(msg WSMessage) {
 	case WSMsgRefreshResult:
 		// 续期结果
 		c.Server.handleRefreshResult(msg.Data)
+
+	case WSMsgQueryStatus:
+		// 客户端查询状态（自主模式）
+		c.Server.sendStatusTo(c)
 	}
 }
 
@@ -330,10 +342,21 @@ func (ps *PoolServer) taskDispatcher() {
 	for {
 		select {
 		case count := <-ps.registerQueue:
+			// 检查是否还需要注册
+			currentCount := ps.pool.TotalCount()
+			pendingCount := int(atomic.LoadInt32(&ps.pendingRegisterCount))
+			needCount := ps.config.TargetCount - currentCount - pendingCount
+			if needCount <= 0 {
+				logger.Debug("[分配] 已达目标数量，跳过注册任务 (当前: %d, 进行中: %d, 目标: %d)",
+					currentCount, pendingCount, ps.config.TargetCount)
+				continue
+			}
 			// 分发注册任务（轮询分配）
-			ps.assignTaskRoundRobin(WSMsgTaskRegister, map[string]interface{}{
+			if ps.assignTaskRoundRobin(WSMsgTaskRegister, map[string]interface{}{
 				"count": count,
-			})
+			}) {
+				atomic.AddInt32(&ps.pendingRegisterCount, 1)
+			}
 
 		case acc := <-ps.refreshQueue:
 			// 分发续期任务（轮询分配）
@@ -408,8 +431,6 @@ func (ps *PoolServer) assignTask(client *WSClient) {
 		maxThreads = 1
 	}
 	assignedCount := 0
-
-	// 如果配置了401自动删除，直接删除待续期的401账号，不下发续期任务
 	if AutoDelete401 {
 		ps.pool.mu.Lock()
 		var toDelete []*Account
@@ -477,8 +498,10 @@ func (ps *PoolServer) assignTask(client *WSClient) {
 	remainingSlots := maxThreads - assignedCount
 	if remainingSlots > 0 {
 		currentCount := ps.pool.TotalCount()
+		pendingCount := int(atomic.LoadInt32(&ps.pendingRegisterCount))
 		targetCount := ps.config.TargetCount
-		needCount := targetCount - currentCount
+		// 计算需要注册的数量时，考虑正在进行中的任务
+		needCount := targetCount - currentCount - pendingCount
 
 		if needCount > 0 {
 			registerCount := remainingSlots
@@ -486,8 +509,8 @@ func (ps *PoolServer) assignTask(client *WSClient) {
 				registerCount = needCount
 			}
 
-			logger.Info("[WS] 分配注册任务给 %s: %d个 (当前: %d, 目标: %d, 线程: %d)",
-				client.ID, registerCount, currentCount, targetCount, maxThreads)
+			logger.Info("[WS] 分配注册任务给 %s: %d个 (当前: %d, 进行中: %d, 目标: %d, 线程: %d)",
+				client.ID, registerCount, currentCount, pendingCount, targetCount, maxThreads)
 			for i := 0; i < registerCount; i++ {
 				msg := WSMessage{
 					Type:      WSMsgTaskRegister,
@@ -500,6 +523,7 @@ func (ps *PoolServer) assignTask(client *WSClient) {
 				select {
 				case client.Send <- msgBytes:
 					assignedCount++
+					atomic.AddInt32(&ps.pendingRegisterCount, 1) // 增加进行中计数
 				default:
 				}
 			}
@@ -507,7 +531,11 @@ func (ps *PoolServer) assignTask(client *WSClient) {
 	}
 
 	if assignedCount == 0 {
-		logger.Debug("[WS] 无任务需要分配给 %s", client.ID)
+		currentCount := ps.pool.TotalCount()
+		pendingCount := int(atomic.LoadInt32(&ps.pendingRegisterCount))
+		targetCount := ps.config.TargetCount
+		logger.Info("[WS] 无任务需要分配给 %s (当前: %d, 进行中: %d, 目标: %d)",
+			client.ID, currentCount, pendingCount, targetCount)
 	}
 }
 
@@ -518,19 +546,243 @@ func (ps *PoolServer) heartbeatChecker() {
 
 	for range ticker.C {
 		ps.clientsMu.RLock()
+		aliveClients := 0
+		totalThreads := 0
 		for id, client := range ps.clients {
 			client.mu.Lock()
 			if time.Since(client.LastPing) > 180*time.Second {
 				client.IsAlive = false
 				logger.Warn("[WS] 客户端 %s 心跳超时 (last: %v ago)", id, time.Since(client.LastPing))
+			} else if client.IsAlive {
+				aliveClients++
+				totalThreads += client.MaxThreads
 			}
 			client.mu.Unlock()
+		}
+		ps.clientsMu.RUnlock()
+
+		pendingCount := atomic.LoadInt32(&ps.pendingRegisterCount)
+
+		if aliveClients == 0 {
+			if pendingCount > 0 {
+				atomic.StoreInt32(&ps.pendingRegisterCount, 0)
+				logger.Info("[心跳] 无活跃客户端，重置 pendingRegisterCount: %d -> 0", pendingCount)
+			}
+		} else {
+			maxReasonable := int32(totalThreads * 2)
+			if maxReasonable < 10 {
+				maxReasonable = 10
+			}
+			if pendingCount > maxReasonable {
+				atomic.StoreInt32(&ps.pendingRegisterCount, 0)
+				logger.Warn("[心跳] pendingRegisterCount 异常 (%d > %d)，已重置", pendingCount, maxReasonable)
+			} else if pendingCount > 0 {
+				// 每分钟衰减：pending 任务不应该长期存在，逐步减少
+				newCount := pendingCount - int32(aliveClients)
+				if newCount < 0 {
+					newCount = 0
+				}
+				if newCount != pendingCount {
+					atomic.StoreInt32(&ps.pendingRegisterCount, newCount)
+					logger.Debug("[心跳] pendingRegisterCount 衰减: %d -> %d", pendingCount, newCount)
+				}
+			}
+		}
+	}
+}
+
+func (ps *PoolServer) periodicTaskBroadcaster() {
+	// 启动时5秒后立即执行一次
+	time.AfterFunc(5*time.Second, func() {
+		ps.broadcastRegisterTasks()
+	})
+
+	// 广播保持30分钟一次
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		ps.broadcastRegisterTasks()
+	}
+}
+
+// poolMaintainer 号池维护：持续检测缺账号就下发
+func (ps *PoolServer) poolMaintainer() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		currentCount := ps.pool.TotalCount()
+		pendingCount := int(atomic.LoadInt32(&ps.pendingRegisterCount))
+		targetCount := ps.config.TargetCount
+		needCount := targetCount - currentCount - pendingCount
+
+		if needCount <= 0 {
+			continue
+		}
+
+		// 缺账号，向所有活跃客户端下发任务
+		ps.clientsMu.RLock()
+		for _, client := range ps.clients {
+			if !client.IsAlive {
+				continue
+			}
+
+			// 每个客户端分配其线程数的任务
+			assignCount := client.MaxThreads
+			if assignCount <= 0 {
+				assignCount = 1
+			}
+			if assignCount > needCount {
+				assignCount = needCount
+			}
+
+			logger.Info("[号池维护] 向 %s 下发 %d 个注册任务 (当前: %d, 进行中: %d, 目标: %d)",
+				client.ID, assignCount, currentCount, pendingCount, targetCount)
+
+			for i := 0; i < assignCount; i++ {
+				msg := WSMessage{
+					Type:      WSMsgTaskRegister,
+					Timestamp: time.Now().Unix(),
+					Data:      map[string]interface{}{"count": 1},
+				}
+				msgBytes, _ := json.Marshal(msg)
+				select {
+				case client.Send <- msgBytes:
+					atomic.AddInt32(&ps.pendingRegisterCount, 1)
+					needCount--
+				default:
+				}
+			}
+
+			if needCount <= 0 {
+				break
+			}
 		}
 		ps.clientsMu.RUnlock()
 	}
 }
 
+func (ps *PoolServer) periodicAccountScanner() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		dataDir := ps.config.DataDir
+		if dataDir == "" {
+			dataDir = DataDir
+		}
+		oldCount := ps.pool.TotalCount()
+		if err := ps.pool.Load(dataDir); err != nil {
+			logger.Warn("[扫描] 加载账号失败: %v", err)
+		} else {
+			newCount := ps.pool.TotalCount()
+			if newCount != oldCount {
+				logger.Info("[扫描] 账号数量变化: %d -> %d", oldCount, newCount)
+			}
+		}
+	}
+}
+
+func (ps *PoolServer) broadcastRegisterTasks() {
+	currentCount := ps.pool.TotalCount()
+	pendingCount := int(atomic.LoadInt32(&ps.pendingRegisterCount))
+	targetCount := ps.config.TargetCount
+	needCount := targetCount - currentCount - pendingCount
+
+	logger.Info("[广播] 检查注册任务 (当前: %d, 进行中: %d, 目标: %d, 需要: %d)",
+		currentCount, pendingCount, targetCount, needCount)
+
+	// 检查是否需要注册
+	if needCount <= 0 {
+		logger.Info("[广播] 已达目标数量，跳过任务广播")
+		return
+	}
+
+	ps.clientsMu.RLock()
+	defer ps.clientsMu.RUnlock()
+
+	if len(ps.clients) == 0 {
+		logger.Warn("[广播] 无在线客户端，跳过任务广播")
+		return
+	}
+
+	totalAssigned := 0
+	for _, client := range ps.clients {
+		if !client.IsAlive {
+			continue
+		}
+
+		// 检查剩余需要的数量
+		remainingNeed := needCount - totalAssigned
+		if remainingNeed <= 0 {
+			break
+		}
+
+		// 每个节点分配其线程数量的任务，但不超过剩余需要的数量
+		assignCount := client.MaxThreads
+		if assignCount <= 0 {
+			assignCount = 1
+		}
+		if assignCount > remainingNeed {
+			assignCount = remainingNeed
+		}
+
+		logger.Info("[广播] 向 %s 分配 %d 个注册任务 (线程: %d)", client.ID, assignCount, client.MaxThreads)
+		for i := 0; i < assignCount; i++ {
+			msg := WSMessage{
+				Type:      WSMsgTaskRegister,
+				Timestamp: time.Now().Unix(),
+				Data: map[string]interface{}{
+					"count": 1,
+				},
+			}
+			msgBytes, _ := json.Marshal(msg)
+			select {
+			case client.Send <- msgBytes:
+				atomic.AddInt32(&ps.pendingRegisterCount, 1)
+				totalAssigned++
+			default:
+				logger.Warn("[广播] 客户端 %s 发送队列满", client.ID)
+			}
+		}
+	}
+
+	if totalAssigned > 0 {
+		logger.Info("[广播] 本轮共分配 %d 个注册任务给 %d 个节点", totalAssigned, len(ps.clients))
+	}
+}
+
+func (ps *PoolServer) sendStatusTo(client *WSClient) {
+	currentCount := ps.pool.TotalCount()
+	pendingCount := int(atomic.LoadInt32(&ps.pendingRegisterCount))
+	targetCount := ps.config.TargetCount
+	needCount := targetCount - currentCount - pendingCount
+
+	msg := WSMessage{
+		Type:      WSMsgStatus,
+		Timestamp: time.Now().Unix(),
+		Data: map[string]interface{}{
+			"current_count": currentCount,
+			"pending_count": pendingCount,
+			"target_count":  targetCount,
+			"need_count":    needCount,
+		},
+	}
+	msgBytes, _ := json.Marshal(msg)
+	select {
+	case client.Send <- msgBytes:
+		logger.Debug("[WS] 发送状态给 %s: current=%d, target=%d, need=%d",
+			client.ID, currentCount, targetCount, needCount)
+	default:
+		logger.Warn("[WS] 发送状态失败，队列满: %s", client.ID)
+	}
+}
+
 func (ps *PoolServer) handleRegisterResult(data map[string]interface{}) {
+	// 减少进行中计数
+	atomic.AddInt32(&ps.pendingRegisterCount, -1)
+
 	success, _ := data["success"].(bool)
 	email, _ := data["email"].(string)
 
@@ -1105,32 +1357,7 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 	found := false
 
 	// 查找并更新 pending 队列
-	for i, acc := range ps.pool.pendingAccounts {
-		if acc.Data.Email == req.Email {
-			acc.Data.Cookies = req.Cookies
-			acc.Data.CookieString = req.CookieString
-			acc.Data.Authorization = req.Authorization
-			acc.Data.ConfigID = req.ConfigID
-			acc.Data.CSESIDX = req.CSESIDX
-			acc.ConfigID = req.ConfigID
-			acc.CSESIDX = req.CSESIDX
-			acc.Refreshed = true
-			acc.FailCount = 0
-			acc.BrowserRefreshCount = 0
-			acc.LastRefresh = time.Now()
-			acc.JWTExpires = time.Time{}
-			// 从 pending 移除
-			ps.pool.pendingAccounts = append(ps.pool.pendingAccounts[:i], ps.pool.pendingAccounts[i+1:]...)
-			ps.pool.mu.Unlock()
-			// 加入 ready 队列
-			ps.pool.MarkReady(acc)
-			found = true
-			goto respond
-		}
-	}
-
-	// 查找并更新 ready 队列
-	for _, acc := range ps.pool.readyAccounts {
+	for _, acc := range ps.pool.pendingAccounts {
 		if acc.Data.Email == req.Email {
 			acc.Mu.Lock()
 			acc.Data.Cookies = req.Cookies
@@ -1142,11 +1369,35 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 			acc.CSESIDX = req.CSESIDX
 			acc.FailCount = 0
 			acc.BrowserRefreshCount = 0
-			acc.LastRefresh = time.Now()
-			acc.JWTExpires = time.Time{}
+			acc.JWTExpires = time.Time{} // 重置JWT过期时间，让refreshWorker去刷新
 			acc.Mu.Unlock()
+			// 保留在 pending 队列，让 refreshWorker 去刷新 JWT
+			logger.Info("🔄 [%s] 账号已更新，等待JWT刷新", req.Email)
 			found = true
 			break
+		}
+	}
+
+	if !found {
+		// 查找并更新 ready 队列
+		for _, acc := range ps.pool.readyAccounts {
+			if acc.Data.Email == req.Email {
+				acc.Mu.Lock()
+				acc.Data.Cookies = req.Cookies
+				acc.Data.CookieString = req.CookieString
+				acc.Data.Authorization = req.Authorization
+				acc.Data.ConfigID = req.ConfigID
+				acc.Data.CSESIDX = req.CSESIDX
+				acc.ConfigID = req.ConfigID
+				acc.CSESIDX = req.CSESIDX
+				acc.FailCount = 0
+				acc.BrowserRefreshCount = 0
+				acc.JWTExpires = time.Time{} // 重置JWT过期时间，下次使用时会触发刷新
+				acc.Mu.Unlock()
+				logger.Info("🔄 [%s] 账号已更新，下次使用时刷新JWT", req.Email)
+				found = true
+				break
+			}
 		}
 	}
 	ps.pool.mu.Unlock()
@@ -1154,8 +1405,6 @@ func (ps *PoolServer) handleUploadAccount(w http.ResponseWriter, r *http.Request
 	if !found {
 		logger.Warn("⚠️ [%s] 账号已保存但未在内存中找到", req.Email)
 	}
-
-respond:
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,

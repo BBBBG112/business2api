@@ -64,10 +64,26 @@ func (sm *SingboxManager) IsAvailable() bool {
 	return sm.ready
 }
 
+// 连通性测试备选URL列表
+var connectivityTestURLs = []string{
+	"https://cp.cloudflare.com/generate_204",
+}
+
+func (sm *SingboxManager) StartRaw(node *ProxyNode) (string, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.startInternal(node, false)
+}
+
+// Start 启动代理并验证连通性（用于需要立即可用的场景）
 func (sm *SingboxManager) Start(node *ProxyNode) (string, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	return sm.startInternal(node, true)
+}
 
+// startInternal 内部启动方法
+func (sm *SingboxManager) startInternal(node *ProxyNode, doTest bool) (string, error) {
 	// 分配端口
 	port := sm.findAvailablePort()
 	if port == 0 {
@@ -98,11 +114,12 @@ func (sm *SingboxManager) Start(node *ProxyNode) (string, error) {
 		return "", fmt.Errorf("启动 sing-box 失败: %w", err)
 	}
 
-	// 等待端口就绪
+	// 等待端口就绪（使用渐进式等待，更快响应）
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	portReady := false
-	for i := 0; i < 20; i++ {
-		time.Sleep(50 * time.Millisecond)
+	waitTimes := []time.Duration{10, 20, 30, 50, 50, 100, 100, 100, 150, 150} // 总计约760ms
+	for _, wait := range waitTimes {
+		time.Sleep(wait * time.Millisecond)
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
 		if err == nil {
 			conn.Close()
@@ -115,24 +132,14 @@ func (sm *SingboxManager) Start(node *ProxyNode) (string, error) {
 		cancel()
 		return "", fmt.Errorf("端口 %d 未就绪", port)
 	}
-	proxyURLParsed, _ := url.Parse(proxyURL)
-	testClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURLParsed),
-		},
-		Timeout: 5 * time.Second,
-	}
-	testResp, testErr := testClient.Get("https://www.gstatic.com/generate_204")
-	if testErr != nil {
-		singBox.Close()
-		cancel()
-		return "", fmt.Errorf("连通性测试失败: %w", testErr)
-	}
-	testResp.Body.Close()
-	if testResp.StatusCode != 204 && testResp.StatusCode != 200 {
-		singBox.Close()
-		cancel()
-		return "", fmt.Errorf("连通性测试状态码: %d", testResp.StatusCode)
+
+	// 如果需要连通性测试
+	if doTest {
+		if err := sm.testConnectivity(proxyURL); err != nil {
+			singBox.Close()
+			cancel()
+			return "", err
+		}
 	}
 
 	instance := &SingboxInstance{
@@ -148,6 +155,32 @@ func (sm *SingboxManager) Start(node *ProxyNode) (string, error) {
 	sm.instances[port] = instance
 	node.LocalPort = port
 	return proxyURL, nil
+}
+
+// testConnectivity 测试代理连通性（支持多URL重试）
+func (sm *SingboxManager) testConnectivity(proxyURL string) error {
+	proxyURLParsed, _ := url.Parse(proxyURL)
+	testClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURLParsed),
+		},
+		Timeout: 8 * time.Second,
+	}
+
+	var lastErr error
+	for _, testURL := range connectivityTestURLs {
+		resp, err := testClient.Get(testURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 204 || resp.StatusCode == 200 {
+			return nil // 成功
+		}
+		lastErr = fmt.Errorf("状态码: %d", resp.StatusCode)
+	}
+	return fmt.Errorf("连通性测试失败: %w", lastErr)
 }
 
 // Stop 停止实例

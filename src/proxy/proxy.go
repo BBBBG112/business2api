@@ -104,11 +104,11 @@ type ProxyManager struct {
 
 // 默认代理使用冷却时间
 var (
-	DefaultProxyUseCooldown = 5 * time.Second // 默认使用冷却
-	MaxProxyFailCount       = 3               // 最大连续失败次数，超过后增加冷却
-	DefaultProxyCount       = 5               // 默认代理池大小
-	MinHealthyForReady      = 1               // 最少健康节点数才提示就绪（改为1，更快就绪）
-	HealthCheckTimeout      = 8 * time.Second // 健康检查超时
+	DefaultProxyUseCooldown = 5 * time.Second  // 默认使用冷却
+	MaxProxyFailCount       = 3                // 最大连续失败次数，超过后增加冷却
+	DefaultProxyCount       = 5                // 默认代理池大小
+	MinHealthyForReady      = 1                // 最少健康节点数才提示就绪（改为1，更快就绪）
+	HealthCheckTimeout      = 10 * time.Second // 健康检查超时（增加到10秒，给慢速代理更多时间）
 )
 
 var Manager = &ProxyManager{
@@ -208,6 +208,10 @@ func (pm *ProxyManager) SetXrayPath(path string) {
 
 // AddSubscribeURL 添加订阅链接
 func (pm *ProxyManager) AddSubscribeURL(url string) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return // 过滤空字符串
+	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.subscribeURLs = append(pm.subscribeURLs, url)
@@ -215,6 +219,10 @@ func (pm *ProxyManager) AddSubscribeURL(url string) {
 
 // AddProxyFile 添加代理文件
 func (pm *ProxyManager) AddProxyFile(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return // 过滤空字符串
+	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.proxyFiles = append(pm.proxyFiles, path)
@@ -226,21 +234,25 @@ func (pm *ProxyManager) LoadAll() error {
 
 	// 从订阅加载
 	for _, url := range pm.subscribeURLs {
+		log.Printf("🔄 正在加载订阅: %s", url)
 		nodes, err := pm.loadFromURL(url)
 		if err != nil {
 			log.Printf("⚠️ 加载订阅失败 %s: %v", url, err)
 			continue
 		}
+		log.Printf("✅ 订阅加载成功: %d 个节点", len(nodes))
 		allNodes = append(allNodes, nodes...)
 	}
 
 	// 从文件加载
 	for _, file := range pm.proxyFiles {
+		log.Printf("🔄 正在加载代理文件: %s", file)
 		nodes, err := pm.loadFromFile(file)
 		if err != nil {
 			log.Printf("⚠️ 加载文件失败 %s: %v", file, err)
 			continue
 		}
+		log.Printf("✅ 文件加载成功: %d 个节点", len(nodes))
 		allNodes = append(allNodes, nodes...)
 	}
 
@@ -249,7 +261,7 @@ func (pm *ProxyManager) LoadAll() error {
 	pm.lastUpdate = time.Now()
 	pm.mu.Unlock()
 
-	log.Printf("✅ 共加载 %d 个代理节点", len(allNodes))
+	log.Printf("✅ 共加载 %d 个代理节点 (订阅: %d, 文件: %d)", len(allNodes), len(pm.subscribeURLs), len(pm.proxyFiles))
 	return nil
 }
 
@@ -996,17 +1008,26 @@ func (pm *ProxyManager) StopAll() {
 	log.Printf("🛑 所有代理实例已停止")
 }
 
-// CheckHealth 检查节点健康并获取出口IP
+// 健康检查备选URL列表
+var healthCheckURLs = []string{
+	"https://cp.cloudflare.com/generate_204",
+}
+
+// CheckHealth 检查节点健康并获取出口IP（优化：使用 StartRaw 避免双重测试）
 func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
-	proxyURL, err := pm.StartXray(node)
+	// 直接代理不需要启动
+	if node.Protocol == "http" || node.Protocol == "https" || node.Protocol == "socks5" {
+		node.Healthy = true
+		node.LastCheck = time.Now()
+		return true
+	}
+
+	// 使用 StartRaw 只启动不测试，避免双重测试
+	proxyURL, err := singboxMgr.StartRaw(node)
 	if err != nil {
 		return false
 	}
-	defer func() {
-		if node.Protocol != "http" && node.Protocol != "https" && node.Protocol != "socks5" {
-			pm.StopXray(node.LocalPort)
-		}
-	}()
+	defer pm.StopXray(node.LocalPort)
 
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
@@ -1021,45 +1042,58 @@ func (pm *ProxyManager) CheckHealth(node *ProxyNode) bool {
 		Timeout:   HealthCheckTimeout,
 	}
 
-	// 第一步：基本连通性检查
-	start := time.Now()
-	resp, err := client.Get(pm.healthCheckURL)
-	if err != nil {
-		return false
+	// 基本连通性检查（支持多URL重试）
+	var success bool
+	var latency time.Duration
+	for _, testURL := range healthCheckURLs {
+		start := time.Now()
+		resp, err := client.Get(testURL)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 204 || resp.StatusCode == 200 {
+			latency = time.Since(start)
+			success = true
+			break
+		}
 	}
-	resp.Body.Close()
 
-	if resp.StatusCode != 204 && resp.StatusCode != 200 {
+	if !success {
 		return false
 	}
-	node.Latency = time.Since(start)
+	node.Latency = latency
+
+	// 获取出口IP（可选，失败不影响健康状态）
 	ipClient := &http.Client{
 		Transport: transport,
 		Timeout:   3 * time.Second,
 	}
 	ipResp, err := ipClient.Get("https://ipinfo.io/ip")
-	if err != nil {
-		return true
-	}
-	defer ipResp.Body.Close()
-
-	if ipResp.StatusCode == 200 {
-		ipBytes, _ := io.ReadAll(ipResp.Body)
-		node.ExitIP = strings.TrimSpace(string(ipBytes))
+	if err == nil {
+		defer ipResp.Body.Close()
+		if ipResp.StatusCode == 200 {
+			ipBytes, _ := io.ReadAll(ipResp.Body)
+			node.ExitIP = strings.TrimSpace(string(ipBytes))
+		}
 	}
 
 	return true
 }
+
+// CheckHealthQuick 快速健康检查（优化：使用 StartRaw 避免双重测试）
 func (pm *ProxyManager) CheckHealthQuick(node *ProxyNode) bool {
-	proxyURL, err := pm.StartXray(node)
+	// 直接代理不需要启动
+	if node.Protocol == "http" || node.Protocol == "https" || node.Protocol == "socks5" {
+		return true
+	}
+
+	// 使用 StartRaw 只启动不测试
+	proxyURL, err := singboxMgr.StartRaw(node)
 	if err != nil {
 		return false
 	}
-	defer func() {
-		if node.Protocol != "http" && node.Protocol != "https" && node.Protocol != "socks5" {
-			pm.StopXray(node.LocalPort)
-		}
-	}()
+	defer pm.StopXray(node.LocalPort)
 
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
@@ -1071,18 +1105,23 @@ func (pm *ProxyManager) CheckHealthQuick(node *ProxyNode) bool {
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   5 * time.Second,
+		Timeout:   6 * time.Second,
 	}
 
-	start := time.Now()
-	resp, err := client.Get(pm.healthCheckURL)
-	if err != nil {
-		return false
+	// 尝试多个测试URL
+	for _, testURL := range healthCheckURLs {
+		start := time.Now()
+		resp, err := client.Get(testURL)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 204 || resp.StatusCode == 200 {
+			node.Latency = time.Since(start)
+			return true
+		}
 	}
-	resp.Body.Close()
-	node.Latency = time.Since(start)
-
-	return resp.StatusCode == 204 || resp.StatusCode == 200
+	return false
 }
 
 func (pm *ProxyManager) CheckAllHealth() {

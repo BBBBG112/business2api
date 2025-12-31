@@ -178,9 +178,9 @@ func (pc *PoolClient) heartbeatPump() {
 	}
 }
 func (pc *PoolClient) writePump() {
-	// 任务请求间隔60秒
-	taskTicker := time.NewTicker(60 * time.Second)
-	defer taskTicker.Stop()
+	registerTicker := time.NewTicker(30 * time.Minute)
+	defer registerTicker.Stop()
+	go pc.doPeriodicRegister()
 
 	for {
 		select {
@@ -198,13 +198,23 @@ func (pc *PoolClient) writePump() {
 				pc.triggerReconnect()
 				return
 			}
-		case <-taskTicker.C:
-			// 定期请求任务
-			pc.sendMessage(WSMessage{
-				Type:      WSMsgRequestTask,
-				Timestamp: time.Now().Unix(),
-			})
+		case <-registerTicker.C:
+			// 每30分钟注册一轮
+			go pc.doPeriodicRegister()
 		}
+	}
+}
+
+func (pc *PoolClient) doPeriodicRegister() {
+	maxThreads := pc.config.ClientThreads
+	if maxThreads <= 0 {
+		maxThreads = 1
+	}
+
+	logger.Info("[定时注册] 开始注册 %d 个账号", maxThreads)
+
+	for i := 0; i < maxThreads; i++ {
+		go pc.handleRegisterTask(map[string]interface{}{"count": 1})
 	}
 }
 
@@ -262,8 +272,8 @@ func (pc *PoolClient) handleMessage(msg WSMessage) {
 		go pc.handleRefreshTask(msg.Data)
 
 	case WSMsgStatus:
-		// 状态同步
-		logger.Debug("收到状态同步: %v", msg.Data)
+		// 状态同步，自主判断是否需要注册
+		go pc.handleStatusAndRegister(msg.Data)
 	}
 }
 
@@ -272,9 +282,18 @@ func (pc *PoolClient) handleRegisterTask(data map[string]interface{}) {
 	// 获取信号量（控制并发数）
 	pc.taskSem <- struct{}{}
 	defer func() { <-pc.taskSem }()
-
-	// 生成任务ID用于日志
 	taskID := time.Now().UnixNano() % 1000
+	resultSent := false
+	defer func() {
+		if !resultSent {
+			if r := recover(); r != nil {
+				logger.Error("[注册 %d] handleRegisterTask panic: %v", taskID, r)
+				pc.sendRegisterResult(false, "", fmt.Sprintf("client panic: %v", r))
+			} else {
+				pc.sendRegisterResult(false, "", "task incomplete")
+			}
+		}
+	}()
 
 	logger.Info("收到注册任务 [%d]", taskID)
 	if GetHealthyCount != nil && GetHealthyCount() >= 1 {
@@ -314,6 +333,45 @@ func (pc *PoolClient) handleRegisterTask(data map[string]interface{}) {
 		}
 		logger.Warn("❌ 注册失败: %s", errMsg)
 		pc.sendRegisterResult(false, "", errMsg)
+	}
+	resultSent = true
+}
+
+func (pc *PoolClient) handleStatusAndRegister(data map[string]interface{}) {
+	needCount := 0
+	if v, ok := data["need_count"].(float64); ok {
+		needCount = int(v)
+	}
+	currentCount := 0
+	if v, ok := data["current_count"].(float64); ok {
+		currentCount = int(v)
+	}
+	targetCount := 0
+	if v, ok := data["target_count"].(float64); ok {
+		targetCount = int(v)
+	}
+
+	if needCount <= 0 {
+		logger.Debug("[自主] 无需注册 (当前: %d, 目标: %d)", currentCount, targetCount)
+		return
+	}
+
+	// 计算本客户端应该注册的数量（不超过线程数和需要数量）
+	maxThreads := pc.config.ClientThreads
+	if maxThreads <= 0 {
+		maxThreads = 1
+	}
+	registerCount := needCount
+	if registerCount > maxThreads {
+		registerCount = maxThreads
+	}
+
+	logger.Info("[自主] 需要注册 %d 个账号 (当前: %d, 目标: %d, 本次: %d)",
+		needCount, currentCount, targetCount, registerCount)
+
+	// 启动注册任务
+	for i := 0; i < registerCount; i++ {
+		go pc.handleRegisterTask(map[string]interface{}{"count": 1})
 	}
 }
 
